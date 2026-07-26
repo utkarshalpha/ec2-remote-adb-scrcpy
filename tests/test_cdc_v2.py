@@ -441,6 +441,18 @@ class CdcV2Tests(unittest.TestCase):
             window.tunnel_label.height(), cdc_v2.APP_BAR_CONTROL_HEIGHT
         )
 
+    def test_connection_actions_remain_equal_with_an_odd_row_width(self):
+        row = cdc_v2.EqualActionRow(spacing=6)
+        left = QPushButton("Connect")
+        right = QPushButton("Start mirror")
+        row.set_actions(left, right)
+        row.resize(317, cdc_v2.PRIMARY_ACTION_HEIGHT)
+        row._layout_actions()
+
+        self.assertEqual(left.size(), right.size())
+        self.assertEqual(left.width(), 155)
+        self.assertEqual(right.x() - left.geometry().right() - 1, 6)
+
     def test_existing_local_adb_transport_is_shown_as_active_and_disconnectable(self):
         window = self._window()
         serial = "127.0.0.1:17000"

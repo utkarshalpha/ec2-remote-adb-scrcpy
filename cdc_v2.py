@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime
 from xml.etree import ElementTree
 
-from PySide6.QtCore import QEvent, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSize, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QShortcut, QWindow
 from PySide6.QtWidgets import (
     QApplication,
@@ -231,6 +231,49 @@ class TapSelectComboBox(QComboBox):
             super().wheelEvent(event)
             return
         event.ignore()
+
+
+class EqualActionRow(QWidget):
+    """Lay out two primary actions at exactly the same pixel size.
+
+    Qt normally gives one button the remainder pixel when a two-column layout
+    has an odd width. That produced the visible 1 px discrepancy on macOS.
+    Manual aspect-neutral geometry leaves the remainder at the trailing edge
+    instead, keeping both controls identical on every platform and scale.
+    """
+
+    def __init__(self, spacing=6, parent=None):
+        super().__init__(parent)
+        self._spacing = int(spacing)
+        self._actions = ()
+        self.setFixedHeight(PRIMARY_ACTION_HEIGHT)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_actions(self, left, right):
+        self._actions = (left, right)
+        for action in self._actions:
+            action.setParent(self)
+            action.show()
+        self._layout_actions()
+
+    def sizeHint(self):
+        return QSize(300, PRIMARY_ACTION_HEIGHT)
+
+    def minimumSizeHint(self):
+        return QSize(206, PRIMARY_ACTION_HEIGHT)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_actions()
+
+    def _layout_actions(self):
+        if len(self._actions) != 2:
+            return
+        action_width = max(1, (self.width() - self._spacing) // 2)
+        action_height = self.height()
+        self._actions[0].setGeometry(0, 0, action_width, action_height)
+        self._actions[1].setGeometry(
+            action_width + self._spacing, 0, action_width, action_height)
 
 
 class CaptureButtonAdapter(v1.ButtonAdapter):
@@ -690,8 +733,8 @@ class CdcV2Window(v1.CdcMainWindow):
         device_row.addWidget(refresh)
         layout.addLayout(device_row)
 
-        connection_actions = QHBoxLayout()
-        connection_actions.setSpacing(6)
+        connection_actions = EqualActionRow(spacing=6)
+        self.connection_actions_row = connection_actions
         self.tunnel_button_widget = _role(QPushButton("Connect"), "primary")
         self.tunnel_button_widget.setObjectName("ConnectionAction")
         self.tunnel_button_widget.setFixedHeight(PRIMARY_ACTION_HEIGHT)
@@ -699,7 +742,6 @@ class CdcV2Window(v1.CdcMainWindow):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.tunnel_button_widget.clicked.connect(
             lambda _checked=False: self._toggle_tunnel())
-        connection_actions.addWidget(self.tunnel_button_widget, 1)
 
         self.start_button_widget = _role(
             QPushButton("Start mirror"), "primary")
@@ -711,8 +753,9 @@ class CdcV2Window(v1.CdcMainWindow):
         self.start_button_widget.setToolTip("Connect a device to start mirroring")
         self.start_button_widget.clicked.connect(
             lambda _checked=False: self._toggle_mirror())
-        connection_actions.addWidget(self.start_button_widget, 1)
-        layout.addLayout(connection_actions)
+        connection_actions.set_actions(
+            self.tunnel_button_widget, self.start_button_widget)
+        layout.addWidget(connection_actions)
 
         self.mirror_status_label = v1._label("Mirror stopped", "StreamState")
         self.mirror_status_label.setProperty("tone", "idle")
