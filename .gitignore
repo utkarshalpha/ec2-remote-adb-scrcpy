@@ -1,0 +1,43 @@
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+.venv-*/
+
+# Local build outputs and versioned binaries
+build*/
+dist*/
+versions/
+
+# Downloaded third-party runtimes (builders fetch verified releases)
+scrcpy-runtime/
+scrcpy-runtime-*/
+
+# Local Codex and editor state
+.codex_work/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Secrets and local connection material
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+auto.crt
+
+# Device/customer diagnostics and generated sessions
+*.log
+*-logs-*.txt
+CDC Sessions/
+*.zip
+
+# Non-source local working documents and experiments
+ProjectSignal_AI_Product_Blueprint.docx
+webrtc-audio-trial/
+vlc-help.txt
