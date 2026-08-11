@@ -572,6 +572,33 @@ class CdcV2Tests(unittest.TestCase):
         self.assertEqual(window.tunnel_label.text(), "Disconnected")
         self.assertFalse(window._external_tunnel)
 
+    def test_managed_tunnel_is_recognised_by_its_private_local_socket(self):
+        """When this app opens the tunnel, the local socket deliberately differs
+        from the port the gateway leased, so the two must not be compared."""
+        window = self._window()
+        window.port_edit.setText("17002")     # leased, from the CDM website
+        window.ssh_port = 49215               # our private local socket
+        window.ssh_remote_port = 17002
+        serial = "127.0.0.1:49215"
+        window._ai_guard_last_serial = serial
+        window._guard_status_by_serial[serial] = "protected"
+
+        window._device_changed(serial)
+
+        self.assertEqual(window.tunnel_label.text(), "Live on 17002")
+        self.assertEqual(window.tunnel_label.property("tone"), "online")
+
+    def test_a_device_on_an_unrelated_port_is_not_claimed_as_ours(self):
+        """A colleague's transport must never be reported as this session's."""
+        window = self._window()
+        window.port_edit.setText("17002")
+        window.ssh_port = 49215
+        window.ssh_remote_port = 17002
+
+        window._device_changed("127.0.0.1:49999")
+
+        self.assertNotEqual(window.tunnel_label.property("tone"), "online")
+
     def test_aspect_host_centers_content_without_cropping(self):
         host = cdc_v2.AspectMirrorHost()
         container = QWidget(host)

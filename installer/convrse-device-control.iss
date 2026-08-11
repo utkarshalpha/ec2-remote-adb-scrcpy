@@ -53,7 +53,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The startup trace is written next to the executable at runtime; a stale one
+; from the build machine must not ship inside the installer.
+Source: "{#SourceDir}\*"; DestDir: "{app}"; \
+  Excludes: "*.log"; \
+  Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"

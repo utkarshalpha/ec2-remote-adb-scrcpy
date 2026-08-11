@@ -1751,13 +1751,23 @@ class CdcV2Window(v1.CdcMainWindow):
 
     def _device_changed(self, serial):
         serial = (serial or "").strip()
-        self.device_pill.setText(serial or "No device")
-        port = legacy.validated_port(self.port_edit.text())
-        expected_local_serial = (
-            f"{legacy.DEFAULT_IP}:{port}" if port is not None else "")
-        if (serial and serial == expected_local_serial
-                and self.tunnel_label.property("tone") != "online"):
-            self._set_tunnel_state(f"Active on {port}", "online")
+        identity = self._connected_identity
+        self.device_pill.setText(
+            identity.label() if (serial and identity) else (serial or "No device"))
+
+        # A live transport can have arrived two ways, and both are legitimate.
+        # When this app opened the tunnel, ADB addresses the device by our
+        # private local socket.  When the operator followed the CDM website's
+        # own instructions in a terminal, the forward is symmetric and the
+        # serial carries the leased port itself.  Recognise either.
+        if serial and self.tunnel_label.property("tone") != "online":
+            leased = conn.parse_endpoint(self.port_edit.text())
+            if self.ssh_port and serial == f"{legacy.DEFAULT_IP}:{self.ssh_port}":
+                self._set_tunnel_state(
+                    f"Live on {self.ssh_remote_port or leased}", "online")
+            elif leased is not None and serial == f"{legacy.DEFAULT_IP}:{leased}":
+                # Someone else's terminal owns this forward; we only ride it.
+                self._set_tunnel_state(f"Active on {leased}", "online")
         if not serial:
             self._guard_generation += 1
             self._stream_probe_generation += 1
