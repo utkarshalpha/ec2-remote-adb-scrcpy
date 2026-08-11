@@ -13,7 +13,11 @@
 #define AppVersion     "2.4.0"
 #define AppPublisher   "Convrse Media Private Limited"
 #define AppExeName     "Convrse Device Control.exe"
-#define SourceDir      "..\dist\ConvrseDeviceControl"
+; Overridable so the build can stage somewhere else when the usual output
+; folder is held open by a scanner or an Explorer window.
+#ifndef SourceDir
+  #define SourceDir    "..\dist\ConvrseDeviceControl"
+#endif
 
 [Setup]
 AppId={{8E5C1F2A-6D74-4F1B-9C3E-2A7B4D9E0C51}

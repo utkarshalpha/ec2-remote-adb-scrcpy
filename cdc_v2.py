@@ -555,7 +555,14 @@ class CdcV2Window(v1.CdcMainWindow):
         self.setWindowTitle(APP_NAME)
         # Remain usable on 1366×768 screens at Windows 150% scaling.
         self.setMinimumSize(820, 500)
-        self.ai_guard_timer.setInterval(5000)
+        # Every tick of this one runs getprop/setprop across the SSH tunnel, so
+        # it is paced for a remote link rather than a USB cable. The properties
+        # it watches drift on reboot or a vendor service restart, not
+        # second-to-second.
+        self.ai_guard_timer.setInterval(15000)
+        # It also runs only while display protection is on. Leaving it ticking
+        # to discover it has nothing to do just burns a wake-up every interval.
+        self._sync_guard_timer()
         QTimer.singleShot(0, self._restore_layout)
 
     # ---------- V2 shell ----------
@@ -602,6 +609,9 @@ class CdcV2Window(v1.CdcMainWindow):
         self._connected_identity = None
         self._pending_local_port = None
         self._pending_remote_port = None
+        self._device_watch_timer = None
+        self._device_watch_target = ""
+        self._device_watch_ticks = 0
 
         self._build_menus()
 
@@ -720,6 +730,7 @@ class CdcV2Window(v1.CdcMainWindow):
         enabled = bool(enabled)
         self._display_protection_enabled = enabled
         self._sync_display_protection_action()
+        self._sync_guard_timer()
         self.settings.setValue("device/display_protection_enabled", enabled)
         self.settings.sync()
         serial = self.active_serial()
@@ -753,6 +764,17 @@ class CdcV2Window(v1.CdcMainWindow):
                 self._finish_initial_guard(target, token, success),
             apply_all=True,
         )
+
+    def _sync_guard_timer(self):
+        """The guard runs only while display protection is on."""
+        timer = getattr(self, "ai_guard_timer", None)
+        if timer is None:
+            return
+        if self._display_protection_enabled:
+            if not timer.isActive():
+                timer.start()
+        elif timer.isActive():
+            timer.stop()
 
     def _sync_display_protection_action(self):
         action = getattr(self, "display_protection_action", None)
@@ -929,23 +951,19 @@ class CdcV2Window(v1.CdcMainWindow):
     def _connection_card_v2(self):
         card, layout = self._card("Device")
 
-        # --- SSH key: one line, no path on screen, no re-picking ------------
-        key_row = QHBoxLayout()
-        key_row.setSpacing(6)
-        key_column = QVBoxLayout()
-        key_column.setSpacing(1)
-        key_column.addWidget(v1._label("SSH KEY", "FieldLabel"))
-        self.key_status_label = v1._label("Checking…", "KeyState")
+        # The key is a once-per-machine setup step, so it lives in File › Add or
+        # change SSH key rather than taking permanent space here. These two stay
+        # as attributes because the key state still drives their text; they are
+        # only shown when there is no key yet and the operator has to act.
+        self.key_status_label = v1._label("", "KeyState")
         self.key_status_label.setProperty("tone", "idle")
         self.key_status_label.setWordWrap(True)
-        key_column.addWidget(self.key_status_label)
-        key_row.addLayout(key_column, 1)
         self.key_button = _role(QPushButton("Add SSH key"), "quiet")
         self.key_button.setObjectName("StandardAction")
         self.key_button.setFixedHeight(CONTROL_HEIGHT)
         self.key_button.clicked.connect(lambda _checked=False: self.select_pem_key())
-        key_row.addWidget(self.key_button)
-        layout.addLayout(key_row)
+        layout.addWidget(self.key_status_label)
+        layout.addWidget(self.key_button)
 
         # --- Leased port: the one value that changes every single session ---
         layout.addWidget(v1._label("ADB PORT FROM THE CDM WEBSITE", "FieldLabel"))
@@ -1099,7 +1117,7 @@ class CdcV2Window(v1.CdcMainWindow):
         Nothing is removed by this; the rarely-touched controls simply stop
         competing for attention with the ones used on every device.
         """
-        button = _role(QPushButton(f"{label}  ▸"), "quiet")
+        button = _role(QPushButton(f"{label}  ▾"), "quiet")
         button.setObjectName("StandardAction")
         button.setFixedHeight(CONTROL_HEIGHT)
         button.setCheckable(True)
@@ -1107,11 +1125,15 @@ class CdcV2Window(v1.CdcMainWindow):
 
         def toggled(checked):
             panel.setVisible(bool(checked))
-            button.setText(f"{label}  " + ("▾" if checked else "▸"))
+            button.setText(f"{label}  " + ("▴" if checked else "▾"))
 
         button.clicked.connect(toggled)
-        layout.addWidget(button)
+        # The panel is added before the button so expanding grows the group
+        # downwards as one block. With the button first, the extra keys appeared
+        # underneath it and split the pad in half, which is what made expanding
+        # look broken.
         layout.addWidget(panel)
+        layout.addWidget(button)
         return button
 
     def _action_button(self, text, callback, role=None):
@@ -1126,14 +1148,17 @@ class CdcV2Window(v1.CdcMainWindow):
         key = self.send_keyevent
 
         layout.addWidget(self._grid_of([
-            self._action_button("Back", lambda: key("4")),
-            self._action_button("Home", lambda: key("3")),
-            self._action_button("Enter / OK", lambda: key("66")),
+            self._action_button("←  Back", lambda: key("4")),
+            self._action_button("⌂  Home", lambda: key("3")),
+            self._action_button("⏎  OK", lambda: key("66")),
         ]))
+        # U+25C4/U+25BA rather than the U+23EE media glyphs: the media set has an
+        # emoji presentation by default, so it rendered in colour next to the
+        # monochrome symbols and looked like a mistake.
         layout.addWidget(self._grid_of([
-            self._action_button("Previous", lambda: key("88")),
-            self._action_button("Play / Pause", lambda: key("85")),
-            self._action_button("Next", lambda: key("87")),
+            self._action_button("◄◄", lambda: key("88")),
+            self._action_button("►  Play", lambda: key("85")),
+            self._action_button("►►", lambda: key("87")),
         ]))
 
         more = QWidget()
@@ -1141,15 +1166,15 @@ class CdcV2Window(v1.CdcMainWindow):
         more_layout.setContentsMargins(0, 4, 0, 0)
         more_layout.setSpacing(4)
         more_layout.addWidget(self._grid_of([
-            self._action_button("Menu", lambda: key("82")),
-            self._action_button("Power", lambda: key("26")),
-            self._action_button("Wake", lambda: key("224")),
-            self._action_button("Sleep", lambda: key("223")),
-            self._action_button("Volume −", lambda: key("25")),
-            self._action_button("Mute", lambda: key("164")),
-            self._action_button("Volume +", lambda: key("24")),
-            self._action_button("Screenshot", self.screenshot),
-            self._action_button("Settings", self.open_device_settings),
+            self._action_button("☰  Menu", lambda: key("82")),
+            self._action_button("⏻  Power", lambda: key("26")),
+            self._action_button("☀  Wake", lambda: key("224")),
+            self._action_button("☾  Sleep", lambda: key("223")),
+            self._action_button("Vol  −", lambda: key("25")),
+            self._action_button("⊘  Mute", lambda: key("164")),
+            self._action_button("Vol  +", lambda: key("24")),
+            self._action_button("⛶  Shot", self.screenshot),
+            self._action_button("⚙  Settings", self.open_device_settings),
         ]))
         custom = QHBoxLayout()
         self.key_edit = QLineEdit()
@@ -1246,11 +1271,47 @@ class CdcV2Window(v1.CdcMainWindow):
         self.ai_controls_panel.hide()
         layout.addWidget(self.ai_controls_panel)
 
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
         verify = _role(QPushButton("Verify now"), "quiet")
         verify.clicked.connect(
             lambda _checked=False: self.verify_ai_pq_state())
-        layout.addWidget(verify)
+        actions.addWidget(verify)
+        # Verifying only ever reported a mismatch and left it in place, so a
+        # device that drifted stayed drifted until someone noticed. Correcting
+        # it is a single command over the ADB root shell we already hold.
+        self.ai_fix_button = _role(QPushButton("Turn processing off"), "primary")
+        self.ai_fix_button.setToolTip(
+            "Set every display-processing property back to off on this device")
+        self.ai_fix_button.clicked.connect(
+            lambda _checked=False: self._correct_display_processing())
+        actions.addWidget(self.ai_fix_button)
+        layout.addLayout(actions)
         return card
+
+    def _correct_display_processing(self):
+        """Apply the off baseline now, whatever the auto-guard toggle says."""
+        serial = self.active_serial()
+        if not serial:
+            QMessageBox.information(
+                self, APP_NAME, "Connect a device first.")
+            return
+        self.ai_fix_button.setEnabled(False)
+        self._set_ai_pq_status("Turning display processing off…", "pending")
+        self.enforce_ai_pq_off(
+            silent=True,
+            on_complete=lambda success: self._finish_display_correction(success),
+            apply_all=True,
+            force=True,
+        )
+
+    def _finish_display_correction(self, success):
+        if self._closing:
+            return
+        self.ai_fix_button.setEnabled(True)
+        if success:
+            self.logline("[AI-PQ] Display processing corrected on request.")
+        self.verify_ai_pq_state()
 
     def _toggle_ai_controls(self, checked):
         checked = bool(checked)
@@ -1682,19 +1743,20 @@ class CdcV2Window(v1.CdcMainWindow):
                 continue
 
     def _sync_key_state(self):
-        """Reflect stored-key state in the sidebar without exposing the key."""
+        """Show the key prompt only while there is no key to use.
+
+        Once imported it never needs attention again, so it stops occupying the
+        sidebar and lives in File > Add or change SSH key instead.
+        """
         has_key = conn.has_stored_key()
-        if has_key:
-            hint = conn.key_fingerprint_hint()
+        self.key_status_label.setVisible(not has_key)
+        self.key_button.setVisible(not has_key)
+        if not has_key:
             self.key_status_label.setText(
-                f"Saved on this computer{f'  ·  {hint}' if hint else ''}")
-            self.key_status_label.setProperty("tone", "online")
-            self.key_button.setText("Replace key")
-        else:
-            self.key_status_label.setText("Not set — add it once to connect")
+                "SSH key not set — add it once to connect")
             self.key_status_label.setProperty("tone", "error")
             self.key_button.setText("Add SSH key")
-        _repolish(self.key_status_label)
+            _repolish(self.key_status_label)
         return has_key
 
     def select_pem_key(self):
@@ -1869,6 +1931,54 @@ class CdcV2Window(v1.CdcMainWindow):
             f"Live on {self.ssh_remote_port}", "online")
         self.ui(self.status_var.set, "Connected")
         self._refresh_devices_job(preferred=target)
+        # ADB can take a few seconds to promote a fresh transport from offline
+        # to device. Poll for it instead of leaving the operator to press
+        # Refresh until something shows up.
+        self.ui(self._start_device_watch, target)
+
+    def _start_device_watch(self, target):
+        """Keep refreshing until the device shows up, then stop.
+
+        A newly attached transport often reports 'offline' for a few seconds
+        before ADB promotes it, which is why pressing Refresh by hand appeared
+        to be necessary.
+        """
+        self._stop_device_watch()
+        self._device_watch_target = target
+        self._device_watch_ticks = 0
+        self._device_watch_timer = QTimer(self)
+        # 1s. This only asks the local ADB server for its transport list, so it
+        # costs a short-lived process and never crosses the tunnel.
+        self._device_watch_timer.setInterval(1000)
+        self._device_watch_timer.timeout.connect(self._device_watch_tick)
+        self._device_watch_timer.start()
+
+    def _stop_device_watch(self):
+        timer = getattr(self, "_device_watch_timer", None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        self._device_watch_timer = None
+
+    def _device_watch_tick(self):
+        if self._closing:
+            self._stop_device_watch()
+            return
+        target = getattr(self, "_device_watch_target", "")
+        # Stop as soon as the device is selectable, the operator picked one
+        # themselves, or the tunnel went away.
+        if self._current_device_serial() or not self.ssh_port:
+            self._stop_device_watch()
+            return
+        self._device_watch_ticks += 1
+        if self._device_watch_ticks > 40:      # about 40 seconds at 1s
+            self._stop_device_watch()
+            self.logline(
+                "[Devices] No device appeared on the tunnel after 40s. "
+                "The lease may have expired; open a fresh one on the CDM website.")
+            self.status_var.set("No device on this tunnel — check the port")
+            return
+        self.worker(lambda: self._refresh_devices_job(preferred=target))
 
     def _read_device_identity(self, serial):
         """Ask the device who it is. This is what makes a stale port harmless."""
@@ -3411,8 +3521,11 @@ class CdcV2Window(v1.CdcMainWindow):
         self.worker(job)
 
     def enforce_ai_pq_off(
-            self, silent=False, on_complete=None, apply_all=False):
-        if apply_all and not self._display_protection_enabled:
+            self, silent=False, on_complete=None, apply_all=False, force=False):
+        # ``force`` is the operator pressing the button themselves. The
+        # display-protection toggle governs whether this runs automatically on
+        # connect; it must not veto an explicit request.
+        if apply_all and not force and not self._display_protection_enabled:
             if on_complete:
                 self.ui(on_complete, True)
             return
@@ -3427,7 +3540,7 @@ class CdcV2Window(v1.CdcMainWindow):
             if (on_complete or apply_all) and not self._closing:
                 self.after(
                     250, self.enforce_ai_pq_off,
-                    silent, on_complete, apply_all)
+                    silent, on_complete, apply_all, force)
             return
         if not silent:
             self._set_ai_pq_status("Enforcing rooted display baseline…", "pending")

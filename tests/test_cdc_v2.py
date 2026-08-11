@@ -1581,3 +1581,50 @@ class CdcV2Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuardTimerTests(unittest.TestCase):
+    """The display guard must not tick while display protection is off."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        # Isolate from the developer's real settings, or this suite would pass
+        # or fail depending on how they last left the toggle.
+        self._temp = TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        path = str(Path(self._temp.name) / "guard-timer-test.ini")
+        patcher = mock.patch.object(
+            cdc_v2, "QSettings",
+            side_effect=lambda *a, **k: QSettings(path, QSettings.Format.IniFormat))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        refresh = mock.patch.object(
+            cdc_v2.CdcV2Window, "refresh_devices", autospec=True)
+        refresh.start()
+        self.addCleanup(refresh.stop)
+
+    def _window(self):
+        window = cdc_v2.CdcV2Window()
+        self.addCleanup(window.deleteLater)
+        self.addCleanup(window.close)
+        self.addCleanup(window.ai_guard_timer.stop)
+        return window
+
+    def test_guard_is_stopped_while_protection_is_off(self):
+        window = self._window()
+        self.assertFalse(window._display_protection_enabled)
+        self.assertFalse(window.ai_guard_timer.isActive())
+
+    def test_guard_starts_and_stops_with_the_toggle(self):
+        window = self._window()
+        window._set_display_protection_enabled(True)
+        self.assertTrue(window.ai_guard_timer.isActive())
+        window._set_display_protection_enabled(False)
+        self.assertFalse(window.ai_guard_timer.isActive())
+
+    def test_guard_is_paced_for_a_remote_link(self):
+        window = self._window()
+        self.assertGreaterEqual(window.ai_guard_timer.interval(), 15000)

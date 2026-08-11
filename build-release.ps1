@@ -92,6 +92,19 @@ if ($running) {
     Start-Sleep -Seconds 1
 }
 Remove-Item -Recurse -Force $DistDir, "$PSScriptRoot\build-release" -ErrorAction SilentlyContinue
+
+# Windows keeps a handle on the output folder for a while after the app runs --
+# Defender, the search indexer and Explorer preview all do it -- and PyInstaller
+# then fails with an opaque access-denied. Stage into a fresh folder instead of
+# demanding the machine let go of the old one.
+if (Test-Path $DistDir) {
+    $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $DistName = "ConvrseDeviceControl-$stamp"
+    $DistDir  = Join-Path $PSScriptRoot "dist\$DistName"
+    $ExePath  = Join-Path $DistDir $ExeName
+    Write-Warn "Previous output folder is locked; staging into $DistName instead."
+}
+$env:CDC_DIST_NAME = $DistName
 python -m PyInstaller --noconfirm --clean `
     --distpath "$PSScriptRoot\dist" `
     --workpath "$PSScriptRoot\build-release" `
@@ -175,7 +188,7 @@ if (-not $iscc) {
     Write-Warn "Install it from https://jrsoftware.org/isdl.php and re-run."
 } else {
     New-Item -ItemType Directory -Force -Path "$PSScriptRoot\dist\installer" | Out-Null
-    & $iscc "$PSScriptRoot\installer\convrse-device-control.iss"
+    & $iscc "/DSourceDir=$DistDir" "$PSScriptRoot\installer\convrse-device-control.iss"
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed." }
     $setup = Join-Path $PSScriptRoot "dist\installer\ConvrseDeviceControl-$AppVersion-Setup.exe"
     if ($Sign -and (Test-Path $setup)) {

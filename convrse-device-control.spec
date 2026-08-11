@@ -18,10 +18,17 @@ no extraction at all.  Nothing here weakens or evades any security control --
 the application simply stops behaving like something worth flagging.
 """
 
+import os
 from pathlib import Path
 
 
 project_root = Path(SPECPATH)
+
+# Windows can keep a handle on the previous output folder -- Defender, the
+# search indexer and Explorer preview all do it -- long after the app exits.
+# The release script stages into a fresh name when that happens, since
+# PyInstaller cannot be told a folder name on the command line alongside a spec.
+dist_name = os.environ.get("CDC_DIST_NAME", "ConvrseDeviceControl")
 runtime_root = project_root / "scrcpy-runtime"
 
 required_runtime_files = ("scrcpy.exe", "scrcpy-server", "adb.exe")
@@ -93,5 +100,5 @@ COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="ConvrseDeviceControl",
+    name=dist_name,
 )
