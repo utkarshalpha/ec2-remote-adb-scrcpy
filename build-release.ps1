@@ -83,6 +83,14 @@ if ($SkipTests) {
 
 # ------------------------------------------------------------------ build --
 Write-Step "Building the one-folder application"
+# A running instance -- often the previous run's smoke check -- holds a lock on
+# the executable and makes PyInstaller fail with an opaque access-denied error.
+$running = Get-Process -Name 'Convrse Device Control' -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Warn "Closing $($running.Count) running instance(s) first."
+    $running | Stop-Process -Force
+    Start-Sleep -Seconds 1
+}
 Remove-Item -Recurse -Force $DistDir, "$PSScriptRoot\build-release" -ErrorAction SilentlyContinue
 python -m PyInstaller --noconfirm --clean `
     --distpath "$PSScriptRoot\dist" `

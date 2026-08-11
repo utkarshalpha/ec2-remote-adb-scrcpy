@@ -136,9 +136,10 @@ AUDIO_BUFFER_MS = 200
 PRIMARY_ACTION_HEIGHT = 40
 CONTROL_HEIGHT = 36
 APP_BAR_CONTROL_HEIGHT = 38
-# Widest sidebar content is 328px (the three-column button grids), plus the
-# shell margins and the vertical scroll bar.
-SIDEBAR_MIN_WIDTH = 356
+# Widest sidebar content is 239px once the rarely-used controls sit behind their
+# disclosures, plus the shell margins and the vertical scroll bar. The old 302px
+# floor clipped the right column of the three-wide grids; this one has room.
+SIDEBAR_MIN_WIDTH = 272
 
 AI_SETTINGS_PACKAGE = "com.android.tv.settings"
 AI_SETTINGS_COMPONENT = f"{AI_SETTINGS_PACKAGE}/.MainSettings"
@@ -563,6 +564,7 @@ class CdcV2Window(v1.CdcMainWindow):
         self._console_collapsed = True
         self._saved_console_sizes = [690, 170]
         self._focus_restore = {}
+        self._alt_key_down = False
         self._mirror_generation = 0
         self._closing = False
         self._last_main_splitter_state = None
@@ -609,8 +611,12 @@ class CdcV2Window(v1.CdcMainWindow):
         self.main_splitter.setSizes([SIDEBAR_MIN_WIDTH, 1200])
         outer.addWidget(self.main_splitter, 1)
 
-        # The menu bar stays visible; focus mode is the only thing that hides it.
-        self.menuBar().setVisible(True)
+        # Visible unless the operator hid it with Alt last session.
+        self.menuBar().setVisible(
+            self._bool_value(self.settings.value("ui/menu_bar_visible", True), True))
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def _build_menus(self):
         menu_bar = self.menuBar()
@@ -745,14 +751,44 @@ class CdcV2Window(v1.CdcMainWindow):
             action.setChecked(enabled)
             action.blockSignals(False)
 
-    # The V2.3 shell hid the menu bar and re-showed it on Alt, policed by an
-    # application-wide event filter.  That filter classified any mouse press it
-    # could not resolve to a QWidget as "outside the menu" and hid the bar --
-    # and Qt routes real mouse input through the popup's QWindow, not its
-    # QWidget.  Every menu click therefore closed the menu before the action
-    # could fire, which is why the View check marks never changed.  The menu bar
-    # is now simply always visible outside focus mode, so there is nothing to
-    # police and no filter to get wrong.
+    def _toggle_menu_bar(self):
+        """Alt shows and hides the menu bar, for a taller mirror."""
+        if self._focus_mode:
+            return
+        menu_bar = self.menuBar()
+        visible = not menu_bar.isVisible()
+        menu_bar.setVisible(visible)
+        self.settings.setValue("ui/menu_bar_visible", visible)
+        if visible:
+            menu_bar.setFocus(Qt.FocusReason.MenuBarFocusReason)
+
+    def eventFilter(self, watched, event):
+        """Alt only.
+
+        The V2.3 filter also policed mouse presses: anything it could not
+        resolve to a QWidget counted as a click outside the menu and hid the
+        bar.  Qt routes real mouse input through the popup's QWindow rather than
+        its QWidget, so every menu click closed the menu before the action could
+        fire -- which is why the View check marks never changed.  No mouse
+        handling lives here now, and hiding the bar no longer disables anything:
+        each action is registered on the window, so its shortcut stays live
+        whether the menus are on screen or not.
+        """
+        if event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Alt and not event.isAutoRepeat():
+                self._alt_key_down = True
+            elif self._alt_key_down:
+                # Alt was part of a combination such as Alt+F4, not a bare tap.
+                self._alt_key_down = False
+        elif event.type() == QEvent.Type.KeyRelease:
+            if event.key() == Qt.Key.Key_Alt and not event.isAutoRepeat():
+                tapped = self._alt_key_down
+                self._alt_key_down = False
+                if tapped:
+                    self._toggle_menu_bar()
+        elif event.type() == QEvent.Type.ApplicationDeactivate:
+            self._alt_key_down = False
+        return super().eventFilter(watched, event)
 
     def _build_app_bar(self):
         bar = QWidget()
@@ -1028,6 +1064,136 @@ class CdcV2Window(v1.CdcMainWindow):
 
         self.connection_details_panel.hide()
         layout.addWidget(self.connection_details_panel)
+        return card
+
+    # ---------- sidebar cards: the everyday controls, then the rest ----------
+    @staticmethod
+    def _grid_of(buttons, columns=3):
+        """Lay buttons out in a grid, returning the container widget."""
+        holder = QWidget()
+        grid = QGridLayout(holder)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(4)
+        for index, button in enumerate(buttons):
+            grid.addWidget(button, index // columns, index % columns)
+        return holder
+
+    def _disclosure(self, layout, label, panel):
+        """A 'More' toggle that reveals the less-used controls.
+
+        Nothing is removed by this; the rarely-touched controls simply stop
+        competing for attention with the ones used on every device.
+        """
+        button = _role(QPushButton(f"{label}  ▸"), "quiet")
+        button.setObjectName("StandardAction")
+        button.setFixedHeight(CONTROL_HEIGHT)
+        button.setCheckable(True)
+        panel.hide()
+
+        def toggled(checked):
+            panel.setVisible(bool(checked))
+            button.setText(f"{label}  " + ("▾" if checked else "▸"))
+
+        button.clicked.connect(toggled)
+        layout.addWidget(button)
+        layout.addWidget(panel)
+        return button
+
+    def _action_button(self, text, callback, role=None):
+        button = QPushButton(text)
+        if role:
+            _role(button, role)
+        button.clicked.connect(lambda _checked=False, slot=callback: slot())
+        return button
+
+    def _remote_card(self):
+        card, layout = self._card("Remote control")
+        key = self.send_keyevent
+
+        layout.addWidget(self._grid_of([
+            self._action_button("Back", lambda: key("4")),
+            self._action_button("Home", lambda: key("3")),
+            self._action_button("Enter / OK", lambda: key("66")),
+        ]))
+        layout.addWidget(self._grid_of([
+            self._action_button("Previous", lambda: key("88")),
+            self._action_button("Play / Pause", lambda: key("85")),
+            self._action_button("Next", lambda: key("87")),
+        ]))
+
+        more = QWidget()
+        more_layout = QVBoxLayout(more)
+        more_layout.setContentsMargins(0, 4, 0, 0)
+        more_layout.setSpacing(4)
+        more_layout.addWidget(self._grid_of([
+            self._action_button("Menu", lambda: key("82")),
+            self._action_button("Power", lambda: key("26")),
+            self._action_button("Wake", lambda: key("224")),
+            self._action_button("Sleep", lambda: key("223")),
+            self._action_button("Volume −", lambda: key("25")),
+            self._action_button("Mute", lambda: key("164")),
+            self._action_button("Volume +", lambda: key("24")),
+            self._action_button("Screenshot", self.screenshot),
+            self._action_button("Settings", self.open_device_settings),
+        ]))
+        custom = QHBoxLayout()
+        self.key_edit = QLineEdit()
+        self.key_edit.setPlaceholderText("Key code")
+        self.key_edit.setMaximumWidth(100)
+        custom.addWidget(self.key_edit)
+        custom.addWidget(
+            self._action_button("Send key code", self.send_custom_keyevent), 1)
+        more_layout.addLayout(custom)
+        self._disclosure(layout, "More controls", more)
+        return card
+
+    def _recovery_card(self):
+        card, layout = self._card("App recovery")
+        self.current_app_label = v1._label(
+            "Foreground app: detected automatically", "Package")
+        self.current_app_label.setWordWrap(True)
+        layout.addWidget(self.current_app_label)
+
+        layout.addWidget(self._grid_of([
+            self._action_button("Restart App", self.restart_current, "primary"),
+            self._action_button("Force Stop", self.force_stop_current),
+        ], columns=2))
+
+        more = QWidget()
+        more_layout = QVBoxLayout(more)
+        more_layout.setContentsMargins(0, 4, 0, 0)
+        more_layout.addWidget(self._grid_of([
+            self._action_button("Clear Cache", self.clear_current_cache),
+            self._action_button("Close Background", self.close_background_apps),
+            self._action_button("Export Logs", self.save_recent_logs),
+            # Clear Data wipes the app's pairing and login state on the device,
+            # so it stays behind the disclosure with its danger styling.
+            self._action_button("Clear Data", self.clear_current_data, "danger"),
+        ], columns=2))
+        self._disclosure(layout, "More recovery", more)
+        return card
+
+    def _tools_card(self):
+        card, layout = self._card("Tools")
+        layout.addWidget(self._grid_of([
+            self._action_button("Open CleanUp", self.open_cleanup_app),
+            self._action_button("Install APK", self.install_apk),
+        ], columns=2))
+
+        more = QWidget()
+        more_layout = QVBoxLayout(more)
+        more_layout.setContentsMargins(0, 4, 0, 0)
+        more_layout.setSpacing(4)
+        more_layout.addWidget(self._grid_of([
+            self._action_button("Open Store", self.open_convrse_store),
+            self._action_button("Launch Claude", self.run_claude),
+        ], columns=2))
+        self.capture_button_widget = _role(
+            QPushButton("Start diagnostic session"), "primary")
+        self.capture_button_widget.clicked.connect(
+            lambda _checked=False: self.toggle_debug_capture())
+        more_layout.addWidget(self.capture_button_widget)
+        self._disclosure(layout, "More tools", more)
         return card
 
     def _ai_pq_card_v2(self):
@@ -2471,9 +2637,8 @@ class CdcV2Window(v1.CdcMainWindow):
             self.restoreGeometry(geometry)
         if restore.get("maximized", True):
             self.showMaximized()
-        # Focus mode is the only thing that hides the menu bar, so leaving it
-        # hidden on exit would strand the user with no menus at all.
-        self.menuBar().setVisible(True)
+        self.menuBar().setVisible(
+            self._bool_value(self.settings.value("ui/menu_bar_visible", True), True))
         self.app_bar.show()
         self.console.show()
         self._set_sidebar_visible(restore.get("sidebar", True), persist=False)
@@ -3334,6 +3499,9 @@ class CdcV2Window(v1.CdcMainWindow):
         if event.isAccepted():
             self._closing = True
             self._mirror_generation += 1
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
         else:
             self._closing = False
 

@@ -230,26 +230,32 @@ class CdcV2Tests(unittest.TestCase):
             "V2", [label.text() for label in window.findChildren(cdc_v2.QLabel)]
         )
 
-    def test_menu_bar_stays_visible_and_survives_interaction(self):
-        """The auto-hiding menu bar is gone, and with it the dead menu clicks.
+    def test_alt_toggles_the_menu_bar_but_nothing_else_hides_it(self):
+        """Alt is a deliberate toggle; clicks and actions must never hide it.
 
-        V2.3 hid the bar and re-showed it on Alt, policed by an application
-        event filter.  That filter treated any mouse press it could not resolve
-        to a QWidget as a click outside the menu -- and Qt delivers real mouse
-        input through the popup's QWindow -- so every menu click closed the menu
-        before the action fired.
+        V2.3 also hid the bar from an application event filter that treated any
+        mouse press it could not resolve to a QWidget as a click outside the
+        menu -- and Qt delivers real mouse input through the popup's QWindow --
+        so every menu click closed the menu before the action fired. The Alt
+        toggle is kept; the mouse handling that broke it is not.
         """
         window = self._window()
         self.assertTrue(window.menuBar().isVisible())
 
         QTest.keyClick(window, Qt.Key.Key_Alt)
         self._drain_events()
+        self.assertFalse(window.menuBar().isVisible())
+
+        QTest.keyClick(window, Qt.Key.Key_Alt)
+        self._drain_events()
         self.assertTrue(window.menuBar().isVisible())
 
+        # A click anywhere in the workspace must leave the menus alone.
         QTest.mouseClick(window.mirror_frame, Qt.MouseButton.LeftButton)
         self._drain_events()
         self.assertTrue(window.menuBar().isVisible())
 
+        # Triggering an action must leave them alone too.
         refresh_action = next(
             action for action in window.findChildren(cdc_v2.QAction)
             if action.text() == "Refresh device"
@@ -258,10 +264,20 @@ class CdcV2Tests(unittest.TestCase):
         self._drain_events()
         self.assertTrue(window.menuBar().isVisible())
 
-        # Escape no longer hides the menus; it only leaves focus mode.
         QTest.keyClick(window, Qt.Key.Key_Escape)
         self._drain_events()
         self.assertTrue(window.menuBar().isVisible())
+
+    def test_shortcuts_still_work_while_the_menu_bar_is_hidden(self):
+        """Hiding the bar used to disable every accelerator in it."""
+        window = self._window()
+        window.menuBar().setVisible(False)
+        self._drain_events()
+
+        before = window.sidebar.isVisible()
+        QTest.keySequence(window, QKeySequence("Ctrl+B"))
+        self._drain_events()
+        self.assertNotEqual(before, window.sidebar.isVisible())
 
     def test_menu_shortcuts_fire_without_the_menu_being_open(self):
         """Menu-bar accelerators were dead because the bar was hidden.
