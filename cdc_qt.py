@@ -763,10 +763,13 @@ class CdcMainWindow(OperationsMixin, QMainWindow):
         card, layout = self._card("Tools & diagnostics")
         grid = QGridLayout()
         grid.setSpacing(4)
+        # Launch Claude opens a terminal preloaded with the selected device's
+        # serial, which the operator uses for ad-hoc device diagnosis.
         controls = [
             ("Install APK", self.install_apk),
             ("Open Store", self.open_convrse_store),
             ("Open CleanUp", self.open_cleanup_app),
+            ("Screenshot", self.screenshot),
             ("Launch Claude", self.run_claude),
         ]
         for index, (title, callback) in enumerate(controls):

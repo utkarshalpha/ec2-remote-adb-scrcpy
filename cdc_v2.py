@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,10 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -31,7 +35,9 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -40,6 +46,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import cdc_connection as conn
 import cdc_qt as v1
 import scrcpy_remote as legacy
 from cdc_ai_guard import (
@@ -55,6 +62,15 @@ from cdc_ai_guard import (
 
 
 APP_NAME = legacy.APP_NAME
+APP_VERSION = "2.4.0"
+
+
+def _qt_version():
+    try:
+        from PySide6 import __version__ as pyside_version
+        return pyside_version
+    except Exception:
+        return "unknown"
 
 
 @dataclass(frozen=True)
@@ -120,6 +136,9 @@ AUDIO_BUFFER_MS = 200
 PRIMARY_ACTION_HEIGHT = 40
 CONTROL_HEIGHT = 36
 APP_BAR_CONTROL_HEIGHT = 38
+# Widest sidebar content is 328px (the three-column button grids), plus the
+# shell margins and the vertical scroll bar.
+SIDEBAR_MIN_WIDTH = 356
 
 AI_SETTINGS_PACKAGE = "com.android.tv.settings"
 AI_SETTINGS_COMPONENT = f"{AI_SETTINGS_PACKAGE}/.MainSettings"
@@ -180,6 +199,18 @@ QLabel#StreamState {{ color: {v1.MUTED}; padding: 2px; }}
 QLabel#StreamState[tone="online"] {{ color: {v1.GREEN}; }}
 QLabel#StreamState[tone="pending"] {{ color: {v1.AMBER}; }}
 QLabel#StreamState[tone="error"] {{ color: {v1.RED}; }}
+QLabel#KeyState {{ font-size: 11px; font-weight: 600; color: {v1.MUTED}; }}
+QLabel#KeyState[tone="online"] {{ color: {v1.GREEN}; }}
+QLabel#KeyState[tone="error"] {{ color: {v1.AMBER}; }}
+QLabel#RouteStrip {{
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 11px; font-weight: 600; color: {v1.SUBTLE};
+    background: {v1.BG_ALT}; border: 1px solid {v1.BORDER};
+    border-radius: 6px; padding: 7px 9px;
+}}
+QLabel#RouteStrip[tone="online"] {{ color: {v1.GREEN}; border-color: #1F5643; }}
+QLabel#RouteStrip[tone="pending"] {{ color: {v1.AMBER}; border-color: #5A4A1E; }}
+QLabel#RouteStrip[tone="error"] {{ color: {v1.RED}; border-color: #5E2833; }}
 QFrame#ToggleRow {{ background: {v1.BG_ALT}; border: 1px solid #1C2C46; border-radius: 5px; }}
 QLabel#ToggleName {{ font-size: 10px; font-weight: 600; color: {v1.MUTED}; }}
 QLabel#ToggleValue {{ font-size: 10px; font-weight: 800; color: {v1.SUBTLE}; }}
@@ -416,6 +447,92 @@ class AspectMirrorHost(QFrame):
         self.foreign_container.setGeometry(x, y, max(1, width), max(1, height))
 
 
+class KeyImportDialog(QDialog):
+    """Take the SSH key once, by paste or by file.
+
+    Pasting is the default because the key usually arrives in a chat message,
+    and asking someone to save it somewhere first is the step that got skipped.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add SSH key")
+        self.setMinimumWidth(520)
+        self.mode = "paste"
+        self.key_text = ""
+        self.file_path = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(9)
+
+        intro = QLabel(
+            "This is stored once on this computer, with access limited to your "
+            "Windows account. You will not be asked for it again.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.paste_radio = QRadioButton("Paste the key text")
+        self.paste_radio.setChecked(True)
+        self.paste_radio.toggled.connect(self._sync_mode)
+        layout.addWidget(self.paste_radio)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setPlaceholderText(
+            "-----BEGIN RSA PRIVATE KEY-----\n…\n-----END RSA PRIVATE KEY-----")
+        self.editor.setMinimumHeight(150)
+        layout.addWidget(self.editor)
+
+        self.file_radio = QRadioButton("Use a .pem file instead")
+        self.file_radio.toggled.connect(self._sync_mode)
+        layout.addWidget(self.file_radio)
+
+        file_row = QHBoxLayout()
+        self.file_edit = QLineEdit()
+        self.file_edit.setPlaceholderText("Path to the .pem file")
+        self.file_edit.setEnabled(False)
+        self.browse_button = QPushButton("Browse…")
+        self.browse_button.setEnabled(False)
+        self.browse_button.clicked.connect(self._browse)
+        file_row.addWidget(self.file_edit, 1)
+        file_row.addWidget(self.browse_button)
+        layout.addLayout(file_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _sync_mode(self):
+        paste = self.paste_radio.isChecked()
+        self.mode = "paste" if paste else "file"
+        self.editor.setEnabled(paste)
+        self.file_edit.setEnabled(not paste)
+        self.browse_button.setEnabled(not paste)
+
+    def _browse(self):
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "Select SSH private key", os.path.expanduser("~"),
+            "PEM private key (*.pem);;All files (*.*)")
+        if path:
+            self.file_edit.setText(path)
+
+    def _accept(self):
+        if self.mode == "file":
+            self.file_path = self.file_edit.text().strip()
+            if not self.file_path:
+                QMessageBox.warning(self, "Add SSH key", "Choose a .pem file first.")
+                return
+        else:
+            self.key_text = self.editor.toPlainText()
+            if not self.key_text.strip():
+                QMessageBox.warning(self, "Add SSH key", "Paste the key text first.")
+                return
+        self.accept()
+
+
 class CdcV2Window(v1.CdcMainWindow):
     def __init__(self):
         super().__init__()
@@ -428,10 +545,14 @@ class CdcV2Window(v1.CdcMainWindow):
     # ---------- V2 shell ----------
     def _build_ui(self):
         # Keep the established settings namespace so existing connection and
-        # profile choices migrate into V2.3 without a brittle one-off copier.
+        # profile choices migrate into V2.3.4 without a brittle one-off copier.
         self.settings = QSettings("Convrse", "Convrse Device Control V2.1")
         saved_preset = self.settings.value("stream/preset", DEFAULT_PRESET, str)
         self.selected_preset = saved_preset if saved_preset in PROFILE_NAMES else DEFAULT_PRESET
+        self._display_protection_enabled = self._bool_value(
+            self.settings.value("device/display_protection_enabled", False),
+            False,
+        )
         self._mirror_state = "stopped"
         self._mirror_requested_stop = False
         self._pending_restart = False
@@ -442,7 +563,6 @@ class CdcV2Window(v1.CdcMainWindow):
         self._console_collapsed = True
         self._saved_console_sizes = [690, 170]
         self._focus_restore = {}
-        self._alt_key_down = False
         self._mirror_generation = 0
         self._closing = False
         self._last_main_splitter_state = None
@@ -460,6 +580,11 @@ class CdcV2Window(v1.CdcMainWindow):
         self._scrcpy_output_lines = []
         self._current_stream_config = None
         self._external_tunnel = False
+        # The local socket and the gateway's leased port are separate values.
+        self.ssh_remote_port = None
+        self._connected_identity = None
+        self._pending_local_port = None
+        self._pending_remote_port = None
 
         self._build_menus()
 
@@ -481,34 +606,52 @@ class CdcV2Window(v1.CdcMainWindow):
         self.main_splitter.addWidget(self._build_workspace())
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
-        self.main_splitter.setSizes([326, 1200])
+        self.main_splitter.setSizes([SIDEBAR_MIN_WIDTH, 1200])
         outer.addWidget(self.main_splitter, 1)
 
-        self.menuBar().hide()
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
+        # The menu bar stays visible; focus mode is the only thing that hides it.
+        self.menuBar().setVisible(True)
 
     def _build_menus(self):
         menu_bar = self.menuBar()
         menu_bar.clear()
+        # Menus are owned by the menu bar, but keeping our own references makes
+        # the ownership explicit and keeps the objects reachable for tests.
+        self._menus = {}
 
-        file_menu = menu_bar.addMenu("&File")
-        self._menu_action(file_menu, "Select SSH key…", self.select_pem_key, "Ctrl+O")
+        file_menu = self._add_menu("&File")
+        self._menu_action(file_menu, "Add or change SSH key…", self.select_pem_key, "Ctrl+O")
         self._menu_action(file_menu, "Install APK…", self.install_apk, "Ctrl+I")
+        file_menu.addSeparator()
+        self.display_protection_action = self._menu_action(
+            file_menu,
+            "Display protection",
+            self._set_display_protection_enabled,
+            checkable=True,
+        )
+        self.display_protection_action.setChecked(
+            self._display_protection_enabled)
+        self._sync_display_protection_action()
+        self.display_protection_action.setToolTip(
+            "On applies protection after connection; off starts the mirror directly")
         file_menu.addSeparator()
         self._menu_action(file_menu, "Save command log…", self._save_command_log, "Ctrl+Shift+S")
         self._menu_action(file_menu, "Open logs folder", self._open_logs_folder)
         file_menu.addSeparator()
-        self._menu_action(file_menu, "Exit", self.close, "Alt+F4")
+        # Alt+F4 stays a Windows window-management key; binding it as an
+        # application shortcut here would only shadow the native behaviour.
+        self._menu_action(file_menu, "Exit", self.close)
 
-        edit_menu = menu_bar.addMenu("&Edit")
-        self._menu_action(edit_menu, "Copy selection", self._copy_log_selection, "Ctrl+C")
+        edit_menu = self._add_menu("&Edit")
+        # Ctrl+C and Ctrl+A intentionally carry no application shortcut: they
+        # already work natively in whichever field has focus, and claiming them
+        # globally would break copy and select-all inside the port and key boxes.
+        self._menu_action(edit_menu, "Copy log selection", self._copy_log_selection)
         self._menu_action(edit_menu, "Copy all command log", self.console_copy_all_safe, "Ctrl+Shift+C")
-        self._menu_action(edit_menu, "Select all", self._select_all_log, "Ctrl+A")
+        self._menu_action(edit_menu, "Select all log text", self._select_all_log)
         self._menu_action(edit_menu, "Clear command log", self._clear_command_log_safe, "Ctrl+K")
 
-        view_menu = menu_bar.addMenu("&View")
+        view_menu = self._add_menu("&View")
         self.sidebar_action = self._menu_action(
             view_menu, "Show sidebar", self._set_sidebar_visible, "Ctrl+B", checkable=True)
         self.sidebar_action.setChecked(True)
@@ -516,91 +659,100 @@ class CdcV2Window(v1.CdcMainWindow):
             view_menu, "Show command log", self._set_console_visible, "Ctrl+J", checkable=True)
         self.console_action.setChecked(False)
         view_menu.addSeparator()
-        self.focus_action = self._menu_action(view_menu, "Focus mirror", self.toggle_focus_mode, "F11")
+        self.focus_action = self._menu_action(
+            view_menu, "Focus mirror", self.set_focus_mode, "F11", checkable=True)
+        self.focus_action.setChecked(False)
         self._menu_action(view_menu, "Reset layout", self.reset_layout, "Ctrl+0")
         self._menu_action(view_menu, "Refresh device", self.refresh_devices, "F5")
 
-        help_menu = menu_bar.addMenu("&Help")
+        help_menu = self._add_menu("&Help")
         self._menu_action(help_menu, "Keyboard shortcuts", self._show_shortcuts, "Ctrl+/")
         self._menu_action(help_menu, "Diagnostics", self._show_diagnostics)
-        self._menu_action(help_menu, "About Convrse Device Control", self._show_about)
+        self._menu_action(help_menu, f"About {APP_NAME}", self._show_about)
+
+    def _add_menu(self, title):
+        menu = self.menuBar().addMenu(title)
+        self._menus[title] = menu
+        return menu
 
     def _menu_action(self, menu, text, callback, shortcut=None, checkable=False):
         action = QAction(text, self)
         action.setCheckable(checkable)
         if shortcut:
             action.setShortcut(QKeySequence(shortcut))
+            # A menu-bar action only receives its shortcut while the menu bar is
+            # on screen.  Scoping to the window and registering the action on the
+            # window itself keeps every accelerator live no matter which panel,
+            # dialog child, or embedded mirror currently holds focus.
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+            self.addAction(action)
         if checkable:
             action.triggered.connect(
                 lambda checked=False, slot=callback: slot(bool(checked)))
         else:
             action.triggered.connect(
                 lambda _checked=False, slot=callback: slot())
-        action.triggered.connect(
-            lambda _checked=False: QTimer.singleShot(0, self._hide_menu_after_action))
         menu.addAction(action)
         return action
 
-    def _hide_menu_bar(self):
-        menu_bar = self.menuBar()
-        menu_bar.setActiveAction(None)
-        menu_bar.hide()
+    def _set_display_protection_enabled(self, enabled):
+        enabled = bool(enabled)
+        self._display_protection_enabled = enabled
+        self._sync_display_protection_action()
+        self.settings.setValue("device/display_protection_enabled", enabled)
+        self.settings.sync()
+        serial = self.active_serial()
 
-    def _hide_menu_after_action(self):
-        if not self._focus_mode:
-            self._hide_menu_bar()
-
-    def _toggle_menu_bar(self):
-        if self._focus_mode:
+        if not enabled:
+            self.status_label.setText("Display protection OFF · direct mirror")
+            self._guard_generation += 1
+            if serial:
+                self._guard_status_by_serial[serial] = "disabled"
+                self._guard_failure_reason_by_serial.pop(serial, None)
+            self._set_ai_pq_status(
+                "Off · mirror starts without display protection", "idle")
+            self.ai_pq_status_label.setToolTip("")
+            if serial and self._mirror_state in ("stopped", "ready", "failed"):
+                self._set_mirror_state(
+                    "ready", "Display protection off · ready to mirror")
+            self.logline("[AI-PQ] Display protection disabled by the user.")
             return
-        menu_bar = self.menuBar()
-        visible = not menu_bar.isVisible()
-        menu_bar.setVisible(visible)
-        if visible:
-            menu_bar.setFocus(Qt.FocusReason.MenuBarFocusReason)
-            actions = menu_bar.actions()
-            if actions:
-                menu_bar.setActiveAction(actions[0])
 
-    def eventFilter(self, watched, event):
-        if event.type() == QEvent.Type.KeyPress:
-            if event.key() == Qt.Key.Key_Alt and not event.isAutoRepeat():
-                self._alt_key_down = True
-                return True
-            if (event.key() == Qt.Key.Key_Escape
-                    and self.menuBar().isVisible() and not self._focus_mode):
-                self._alt_key_down = False
-                self._hide_menu_bar()
-                return True
-            if self._alt_key_down:
-                self._alt_key_down = False
-        elif event.type() == QEvent.Type.KeyRelease:
-            if event.key() == Qt.Key.Key_Alt and not event.isAutoRepeat():
-                toggle = self._alt_key_down
-                self._alt_key_down = False
-                if toggle:
-                    self._toggle_menu_bar()
-                    return True
-        elif event.type() == QEvent.Type.MouseButtonPress:
-            menu_bar = self.menuBar()
-            if menu_bar.isVisible() and not self._focus_mode:
-                popup = QApplication.activePopupWidget()
-                menu_interaction = (
-                    watched is menu_bar
-                    or (isinstance(watched, QWidget)
-                        and menu_bar.isAncestorOf(watched))
-                    or (popup is not None and (
-                        watched is popup
-                        or (isinstance(watched, QWidget)
-                            and popup.isAncestorOf(watched))
-                    ))
-                )
-                if not menu_interaction:
-                    self._hide_menu_bar()
-        elif event.type() == QEvent.Type.ApplicationDeactivate:
-            self._alt_key_down = False
-            self._hide_menu_bar()
-        return super().eventFilter(watched, event)
+        self.status_label.setText("Display protection ON · user enabled")
+        self._set_ai_pq_status("Display protection enabled", "pending")
+        self.logline("[AI-PQ] Display protection enabled by the user.")
+        if not serial:
+            return
+        self._guard_generation += 1
+        generation = self._guard_generation
+        self._guard_status_by_serial[serial] = "protecting"
+        self.enforce_ai_pq_off(
+            silent=True,
+            on_complete=lambda success, target=serial, token=generation:
+                self._finish_initial_guard(target, token, success),
+            apply_all=True,
+        )
+
+    def _sync_display_protection_action(self):
+        action = getattr(self, "display_protection_action", None)
+        if action is None:
+            return
+        # The check mark is the state. Repeating it in the label as ON/OFF only
+        # gave two things to disagree with each other.
+        enabled = bool(self._display_protection_enabled)
+        if action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+    # The V2.3 shell hid the menu bar and re-showed it on Alt, policed by an
+    # application-wide event filter.  That filter classified any mouse press it
+    # could not resolve to a QWidget as "outside the menu" and hid the bar --
+    # and Qt routes real mouse input through the popup's QWindow, not its
+    # QWidget.  Every menu click therefore closed the menu before the action
+    # could fire, which is why the View check marks never changed.  The menu bar
+    # is now simply always visible outside focus mode, so there is nothing to
+    # police and no filter to get wrong.
 
     def _build_app_bar(self):
         bar = QWidget()
@@ -659,8 +811,13 @@ class CdcV2Window(v1.CdcMainWindow):
     def _build_sidebar(self):
         shell = QFrame()
         shell.setObjectName("SidebarV2")
-        shell.setMinimumWidth(302)
-        shell.setMaximumWidth(365)
+        # The three-column recovery and remote grids need 328px of content, and
+        # the old 302px floor clipped the right-hand column of every one of them
+        # -- Refresh, Volume +, Clear Cache and Export Logs were all cut in half
+        # at the default splitter position. Width now accounts for the content,
+        # the layout margins and the vertical scroll bar.
+        shell.setMinimumWidth(SIDEBAR_MIN_WIDTH)
+        shell.setMaximumWidth(430)
         shell_layout = QVBoxLayout(shell)
         shell_layout.setContentsMargins(7, 7, 4, 7)
 
@@ -721,6 +878,48 @@ class CdcV2Window(v1.CdcMainWindow):
     def _connection_card_v2(self):
         card, layout = self._card("Device")
 
+        # --- SSH key: one line, no path on screen, no re-picking ------------
+        key_row = QHBoxLayout()
+        key_row.setSpacing(6)
+        key_column = QVBoxLayout()
+        key_column.setSpacing(1)
+        key_column.addWidget(v1._label("SSH KEY", "FieldLabel"))
+        self.key_status_label = v1._label("Checking…", "KeyState")
+        self.key_status_label.setProperty("tone", "idle")
+        self.key_status_label.setWordWrap(True)
+        key_column.addWidget(self.key_status_label)
+        key_row.addLayout(key_column, 1)
+        self.key_button = _role(QPushButton("Add SSH key"), "quiet")
+        self.key_button.setObjectName("StandardAction")
+        self.key_button.setFixedHeight(CONTROL_HEIGHT)
+        self.key_button.clicked.connect(lambda _checked=False: self.select_pem_key())
+        key_row.addWidget(self.key_button)
+        layout.addLayout(key_row)
+
+        # --- Leased port: the one value that changes every single session ---
+        layout.addWidget(v1._label("ADB PORT FROM THE CDM WEBSITE", "FieldLabel"))
+        self.port_edit = QLineEdit()
+        self.port_edit.setPlaceholderText("e.g. 17002")
+        self.port_edit.setFixedHeight(CONTROL_HEIGHT)
+        self.port_edit.setToolTip(
+            "The website leases a different port each time a tunnel is opened. "
+            "Paste whatever it shows for this device now.")
+        self.port_edit.returnPressed.connect(self._toggle_tunnel)
+        layout.addWidget(self.port_edit)
+
+        # --- Route strip: local socket, leased port, and who answered -------
+        self.route_label = v1._label("Not connected", "RouteStrip")
+        self.route_label.setProperty("tone", "idle")
+        self.route_label.setWordWrap(True)
+        layout.addWidget(self.route_label)
+
+        # Kept for the inherited operations code, which reads these adapters.
+        self.ip_edit = QLineEdit(legacy.DEFAULT_IP)
+        self.ip_edit.setReadOnly(True)
+        self.ip_edit.hide()
+        self.pem_edit = QLineEdit()
+        self.pem_edit.hide()
+
         device_row = QHBoxLayout()
         self.device_combo = QComboBox()
         self.device_combo.setPlaceholderText("Select device")
@@ -762,7 +961,11 @@ class CdcV2Window(v1.CdcMainWindow):
         self.mirror_status_label.setWordWrap(True)
         layout.addWidget(self.mirror_status_label)
 
-        self.connection_details_button = _role(QPushButton("Connection details  ▸"), "quiet")
+        # The leased port has to be entered every session, so the fields that
+        # used to hide behind a "Connection details" disclosure now sit in the
+        # open. Only the stream tuning stays collapsible.
+        self.connection_details_button = _role(
+            QPushButton("Stream settings  ▸"), "quiet")
         self.connection_details_button.setObjectName("StandardAction")
         self.connection_details_button.setFixedHeight(CONTROL_HEIGHT)
         self.connection_details_button.setCheckable(True)
@@ -773,31 +976,6 @@ class CdcV2Window(v1.CdcMainWindow):
         detail_layout = QVBoxLayout(self.connection_details_panel)
         detail_layout.setContentsMargins(0, 1, 0, 0)
         detail_layout.setSpacing(6)
-        detail_layout.addWidget(v1._label("SSH PRIVATE KEY", "FieldLabel"))
-        key_row = QHBoxLayout()
-        self.pem_edit = QLineEdit()
-        self.pem_edit.setPlaceholderText("Select a .pem private key")
-        self.pem_edit.setFixedHeight(CONTROL_HEIGHT)
-        browse = _role(QPushButton("Browse"), "quiet")
-        browse.setObjectName("StandardAction")
-        browse.setFixedHeight(CONTROL_HEIGHT)
-        browse.clicked.connect(lambda _checked=False: self.select_pem_key())
-        key_row.addWidget(self.pem_edit, 1)
-        key_row.addWidget(browse)
-        detail_layout.addLayout(key_row)
-
-        endpoint = QGridLayout()
-        endpoint.addWidget(v1._label("ADB PORT", "FieldLabel"), 0, 0)
-        endpoint.addWidget(v1._label("LOCAL HOST", "FieldLabel"), 0, 1)
-        self.port_edit = QLineEdit(legacy.DEFAULT_ADB_PORT)
-        self.ip_edit = QLineEdit(legacy.DEFAULT_IP)
-        self.ip_edit.setReadOnly(True)
-        self.port_edit.setFixedHeight(CONTROL_HEIGHT)
-        self.ip_edit.setFixedHeight(CONTROL_HEIGHT)
-        endpoint.addWidget(self.port_edit, 1, 0)
-        endpoint.addWidget(self.ip_edit, 1, 1)
-        detail_layout.addLayout(endpoint)
-        detail_layout.addWidget(v1._label(f"Gateway  {legacy.SSH_HOST}", "Tertiary"))
 
         detail_layout.addWidget(v1._label("STREAM PRESET", "FieldLabel"))
         self.profile_combo = TapSelectComboBox()
@@ -950,14 +1128,14 @@ class CdcV2Window(v1.CdcMainWindow):
         self.device_box = v1.ComboAdapter(self.device_combo)
         self.device_combo.currentTextChanged.connect(self._device_changed)
 
-        saved_pem = self.settings.value("connection/pem", "", str)
-        if not saved_pem:
-            candidate = os.path.join(os.path.expanduser("~"), "Downloads", "cdm-key.pem")
-            if os.path.isfile(candidate):
-                saved_pem = candidate
-        self.pem_edit.setText(saved_pem)
-        self.port_edit.setText(
-            self.settings.value("connection/port", legacy.DEFAULT_ADB_PORT, str))
+        self._migrate_legacy_key()
+        self._sync_key_state()
+        if conn.has_stored_key():
+            self.pem_edit.setText(str(conn.stored_key_path()))
+        # The leased port is deliberately not restored. Reusing yesterday's
+        # number is exactly how an operator ends up attached to whichever device
+        # the gateway has since put there, which may be a colleague's.
+        self.port_edit.clear()
         self._load_custom_profile()
 
         self.focus_escape_shortcut = QShortcut(QKeySequence("Escape"), self)
@@ -980,7 +1158,7 @@ class CdcV2Window(v1.CdcMainWindow):
         main_state = self.settings.value("ui/main_splitter")
         workspace_state = self.settings.value("ui/workspace_splitter")
         if not main_state or not self.main_splitter.restoreState(main_state):
-            self.main_splitter.setSizes([326, 1200])
+            self.main_splitter.setSizes([SIDEBAR_MIN_WIDTH, 1200])
         else:
             self._last_main_splitter_state = main_state
         if not workspace_state or not self.workspace_splitter.restoreState(workspace_state):
@@ -999,15 +1177,19 @@ class CdcV2Window(v1.CdcMainWindow):
         self.connection_details_button.setChecked(details_visible)
         self.connection_details_panel.setVisible(details_visible)
         self.connection_details_button.setText(
-            "Connection details  ▾" if details_visible else "Connection details  ▸")
+            "Stream settings  ▾" if details_visible else "Stream settings  ▸")
         category = max(0, min(1, self.settings.value("ui/category", 0, int)))
         self._show_category(category)
         self._set_mirror_state("stopped")
 
     def _save_layout(self):
-        self.settings.setValue("connection/pem", self.pem_edit.text().strip())
-        self.settings.setValue("connection/port", self.port_edit.text().strip())
+        # The key lives in its own store; the leased port is per-session and is
+        # intentionally never carried over to the next launch.
         self.settings.setValue("stream/preset", self.selected_preset)
+        self.settings.setValue(
+            "device/display_protection_enabled",
+            self._display_protection_enabled,
+        )
         self.settings.setValue(
             "ui/connection_details", self.connection_details_button.isChecked())
         self.settings.setValue("ui/category", self.category_stack.currentIndex())
@@ -1039,7 +1221,7 @@ class CdcV2Window(v1.CdcMainWindow):
     def _toggle_connection_details(self, checked):
         self.connection_details_panel.setVisible(bool(checked))
         self.connection_details_button.setText(
-            "Connection details  ▾" if checked else "Connection details  ▸")
+            "Stream settings  ▾" if checked else "Stream settings  ▸")
         self.settings.setValue("ui/connection_details", bool(checked))
 
     def toggle_sidebar(self):
@@ -1099,7 +1281,7 @@ class CdcV2Window(v1.CdcMainWindow):
             self.exit_focus_mode()
         self._set_sidebar_visible(True)
         self._set_console_visible(False)
-        self.main_splitter.setSizes([326, max(700, self.width() - 326)])
+        self.main_splitter.setSizes([SIDEBAR_MIN_WIDTH, max(700, self.width() - SIDEBAR_MIN_WIDTH)])
         self.workspace_splitter.setSizes([max(430, self.height() - 102), 22])
         self._last_main_splitter_state = self.main_splitter.saveState()
         self._last_workspace_splitter_state = self.workspace_splitter.saveState()
@@ -1141,10 +1323,17 @@ class CdcV2Window(v1.CdcMainWindow):
     def _show_shortcuts(self):
         QMessageBox.information(
             self, "Keyboard shortcuts",
-            "Alt  Show/hide menu\nF11  Focus mirror\nEsc  Exit focus mode\n"
-            "Ctrl+B  Show/hide sidebar\n"
-            "Ctrl+J  Show/hide command log\nCtrl+L  Focus command log\n"
-            "F5  Refresh devices\nCtrl+0  Reset layout")
+            "F11\tFocus mirror\n"
+            "Esc\tExit focus mode\n"
+            "Ctrl+B\tShow or hide sidebar\n"
+            "Ctrl+J\tShow or hide command log\n"
+            "Ctrl+L\tFocus command log\n"
+            "Ctrl+K\tClear command log\n"
+            "F5\tRefresh devices\n"
+            "Ctrl+0\tReset layout\n"
+            "Ctrl+O\tAdd or change SSH key\n"
+            "Ctrl+I\tInstall APK\n"
+            "Ctrl+Shift+S\tSave command log")
 
     def _show_diagnostics(self):
         self._set_sidebar_visible(True)
@@ -1154,10 +1343,14 @@ class CdcV2Window(v1.CdcMainWindow):
 
     def _show_about(self):
         QMessageBox.about(
-            self, APP_NAME,
-            f"{APP_NAME}\n\n"
-            "Mirror-first Android operations, recovery, and diagnostics workspace.\n"
-            "PySide6 · scrcpy · ADB · SSH")
+            self, f"About {APP_NAME}",
+            f"<b>{APP_NAME}</b><br>"
+            f"Version {APP_VERSION}<br><br>"
+            "Mirror-first Android operations, recovery, and diagnostics "
+            "workspace for the Convrse device fleet.<br><br>"
+            f"Gateway&nbsp;&nbsp;{legacy.SSH_HOST}<br>"
+            f"Runtime&nbsp;&nbsp;PySide6 {_qt_version()} · scrcpy · ADB · OpenSSH<br>"
+            f"Settings&nbsp;&nbsp;{self.settings.fileName()}")
 
     def _focus_command_log(self):
         if self._focus_mode:
@@ -1285,6 +1478,250 @@ class CdcV2Window(v1.CdcMainWindow):
         else:
             self.connect_tunnel()
 
+    # ---------- SSH key: imported once, then never asked for again ----------
+    def _migrate_legacy_key(self):
+        """Adopt a key chosen by an earlier build so nobody re-imports by hand."""
+        if conn.has_stored_key():
+            return
+        candidates = []
+        saved = self.settings.value("connection/pem", "", str)
+        if saved:
+            candidates.append(saved)
+        candidates.append(
+            os.path.join(os.path.expanduser("~"), "Downloads", "cdm-key.pem"))
+        for candidate in candidates:
+            try:
+                if candidate and os.path.isfile(candidate):
+                    conn.import_key_file(candidate)
+                    self.logline(
+                        f"[Key] Imported the existing key from {candidate} into "
+                        "private storage. You will not be asked for it again.")
+                    return
+            except conn.KeyImportError:
+                continue
+
+    def _sync_key_state(self):
+        """Reflect stored-key state in the sidebar without exposing the key."""
+        has_key = conn.has_stored_key()
+        if has_key:
+            hint = conn.key_fingerprint_hint()
+            self.key_status_label.setText(
+                f"Saved on this computer{f'  ·  {hint}' if hint else ''}")
+            self.key_status_label.setProperty("tone", "online")
+            self.key_button.setText("Replace key")
+        else:
+            self.key_status_label.setText("Not set — add it once to connect")
+            self.key_status_label.setProperty("tone", "error")
+            self.key_button.setText("Add SSH key")
+        _repolish(self.key_status_label)
+        return has_key
+
+    def select_pem_key(self):
+        """Import the key by paste or file. Replaces the old browse-every-time."""
+        dialog = KeyImportDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            if dialog.mode == "file":
+                path = conn.import_key_file(dialog.file_path)
+            else:
+                path = conn.import_key_text(dialog.key_text)
+        except conn.KeyImportError as exc:
+            QMessageBox.warning(self, "SSH key", str(exc))
+            return
+        self.settings.setValue("connection/pem", str(path))
+        self.settings.sync()
+        self._sync_key_state()
+        self.logline(f"[Key] Stored at {path} with access limited to this account.")
+        self.status_var.set("SSH key saved")
+
+    def _require_key(self):
+        if conn.has_stored_key():
+            return str(conn.stored_key_path())
+        QMessageBox.information(
+            self, "SSH key needed",
+            "Add the cdm.convrse.ai SSH key once and this computer will not ask "
+            "again.\n\nYou can paste the key text or pick the .pem file.")
+        self.select_pem_key()
+        return str(conn.stored_key_path()) if conn.has_stored_key() else None
+
+    # ---------- tunnel: leased remote port, private local socket ----------
+    def _set_route_state(self, text, tone="idle"):
+        self.route_label.setText(text)
+        self.route_label.setProperty("tone", tone)
+        _repolish(self.route_label)
+
+    def connect_tunnel(self):
+        pem_path = self._require_key()
+        if not pem_path:
+            return
+
+        remote_port = conn.parse_endpoint(self.port_edit.text())
+        if remote_port is None:
+            QMessageBox.warning(
+                self, APP_NAME,
+                "Enter the ADB port that the CDM website shows for this device.\n\n"
+                "The website leases a different port every time a tunnel is "
+                "opened, so this value changes between sessions and between "
+                "colleagues. Paste whatever it shows now.")
+            self.port_edit.setFocus()
+            self.port_edit.selectAll()
+            return
+        self.port_edit.setText(str(remote_port))
+
+        ssh_executable = shutil.which("ssh.exe") or shutil.which("ssh")
+        if not ssh_executable:
+            QMessageBox.critical(
+                self, APP_NAME,
+                "Windows OpenSSH was not found.\n\n"
+                "Install it from Settings › System › Optional features › "
+                "OpenSSH Client, then try again.")
+            return
+
+        local_port = conn.find_free_local_port()
+        self._pending_local_port = local_port
+        self._pending_remote_port = remote_port
+        target = f"{legacy.DEFAULT_IP}:{local_port}"
+
+        self.ip_edit.setText(f"{legacy.DEFAULT_IP}:{local_port}")
+        self._set_route_state(
+            conn.describe_route(local_port, remote_port, legacy.SSH_HOST), "pending")
+        self.status_var.set(f"Opening tunnel to leased port {remote_port} …")
+        self._set_tunnel_state("Connecting…", "pending")
+
+        def job():
+            command = conn.build_ssh_command(
+                ssh_executable, pem_path, local_port, remote_port, legacy.SSH_HOST)
+            self.logline("[SSH] " + legacy.command_text(command))
+            try:
+                proc = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    creationflags=legacy._NO_WINDOW,
+                )
+            except OSError as exc:
+                self._fail_tunnel(f"Could not start SSH: {exc}")
+                return
+
+            self.ssh_proc = proc
+            self.ssh_port = local_port
+            self.ssh_remote_port = remote_port
+            self.ssh_pem = pem_path
+            threading.Thread(
+                target=self._watch_ssh_output, args=(proc,), daemon=True).start()
+
+            for _ in range(40):
+                if proc.poll() is not None:
+                    break
+                if conn.is_port_in_use(local_port):
+                    break
+                time.sleep(0.25)
+            else:
+                self._fail_tunnel(
+                    f"The forward to leased port {remote_port} never came up.")
+                return
+            if proc.poll() is not None:
+                self._fail_tunnel(
+                    "SSH exited before the tunnel opened. If it reports "
+                    "'Permission denied (publickey)', the key needs replacing.")
+                return
+
+            self.ui(
+                self._set_route_state,
+                conn.describe_route(local_port, remote_port, legacy.SSH_HOST),
+                "online")
+            self._connect_adb_target(target)
+
+        self.worker(job)
+
+    def _fail_tunnel(self, message):
+        self.logline("[SSH] " + message)
+        self.ui(self._set_tunnel_state, "Connection failed", "error")
+        self.ui(self._set_route_state, message, "error")
+        self.ui(self.status_var.set, "Tunnel failed — see command log")
+        proc = self.ssh_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        self.ssh_proc = None
+
+    def _connect_adb_target(self, target):
+        """Attach ADB, then prove which device actually answered."""
+        result = legacy.adb_command("connect", target, timeout=40)
+        self.logline(f"[ADB] connect {target}: {result[1] or 'no response'}")
+        output = (result[1] or "").lower()
+        if result[0] != 0 or not ("connected" in output or "already" in output):
+            self._fail_tunnel(f"ADB could not attach to {target}.")
+            return
+
+        identity = self._read_device_identity(target)
+        if not identity:
+            self.logline(
+                "[ADB] The device did not answer a property query. Treating the "
+                "tunnel as up but unverified.")
+        else:
+            self._connected_identity = identity
+            self.logline(
+                f"[Device] {identity.label()}"
+                + (f" · {identity.model}" if identity.model else "")
+                + (f" · Android {identity.android}" if identity.android else ""))
+            self.ui(self.device_pill.setText, identity.label())
+
+        self.ui(
+            self._set_tunnel_state,
+            f"Live on {self.ssh_remote_port}", "online")
+        self.ui(self.status_var.set, "Connected")
+        self._refresh_devices_job(preferred=target)
+
+    def _read_device_identity(self, serial):
+        """Ask the device who it is. This is what makes a stale port harmless."""
+        props = {}
+        for key in ("ro.serialno", "ro.product.model", "ro.product.device",
+                    "ro.build.version.release"):
+            rc, out, _elapsed = legacy.adb_command(
+                "shell", "getprop", key, serial=serial, timeout=15,
+                telemetry=False)
+            props[key] = (out or "").strip() if rc == 0 else ""
+        if not any(props.values()):
+            return None
+        return conn.DeviceIdentity(
+            serial=props.get("ro.serialno", ""),
+            model=props.get("ro.product.model", ""),
+            name=props.get("ro.product.device", ""),
+            android=props.get("ro.build.version.release", ""),
+        )
+
+    def disconnect_tunnel(self):
+        local_port = self.ssh_port
+        target = f"{legacy.DEFAULT_IP}:{local_port}" if local_port else None
+        proc = self.ssh_proc
+        self.ssh_proc = None
+        self._connected_identity = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+        def job():
+            if target:
+                result = legacy.adb_command("disconnect", target, timeout=20)
+                self.logline(f"[ADB] disconnect {target}: {result[1] or 'done'}")
+            self.ui(self._set_tunnel_state, "Disconnected", "idle")
+            self.ui(self._set_route_state, "Not connected", "idle")
+            self.ui(self.status_var.set, "Disconnected")
+            self.ui(self.device_pill.setText, "No device")
+
+        self.ssh_port = None
+        self.ssh_remote_port = None
+        self.worker(job)
+
     def _set_tunnel_state(self, text, tone="idle"):
         if tone == "online":
             self._external_tunnel = not (
@@ -1340,16 +1777,31 @@ class CdcV2Window(v1.CdcMainWindow):
             self._ai_guard_last_serial = serial
             self._root_mode_by_serial.clear()
             self._root_failure_reason_by_serial.pop(serial, None)
-            self._guard_status_by_serial[serial] = "protecting"
+            self._guard_status_by_serial[serial] = (
+                "protecting" if self._display_protection_enabled else "disabled")
             self._load_custom_profile(serial)
             self._refresh_profile_combo_labels()
-            self._set_ai_pq_status("Starting automatic protection…", "pending")
+            if self._display_protection_enabled:
+                self._set_ai_pq_status("Applying display protection…", "pending")
+            else:
+                self._set_ai_pq_status(
+                    "Off · mirror starts without display protection", "idle")
             if self.scrcpy_proc and self.scrcpy_proc.poll() is None:
                 self._mirror_requested_stop = True
                 self._pending_restart = False
                 self._terminate_scrcpy()
             self._set_mirror_state(
-                "protecting", "Securing display settings before mirroring…")
+                "ready",
+                "Connected · display protection running in background…"
+                if self._display_protection_enabled
+                else "Connected · display protection off",
+            )
+            self._start_stream_capability_probe(serial)
+            if not self._display_protection_enabled:
+                self._guard_status_by_serial[serial] = "disabled"
+                self._set_ai_pq_status(
+                    "Off · mirror starts without display protection", "idle")
+                return
             self.enforce_ai_pq_off(
                 silent=True,
                 on_complete=lambda success, target=serial, token=generation:
@@ -1359,15 +1811,18 @@ class CdcV2Window(v1.CdcMainWindow):
             return
 
         guard_status = self._guard_status_by_serial.get(serial)
-        if guard_status in ("protected", "not_applicable"):
-            if self._mirror_state in ("stopped", "failed", "guard_failed"):
-                self._set_mirror_state("ready")
+        if guard_status in ("protected", "not_applicable", "disabled"):
+            if self._mirror_state in ("stopped", "failed"):
+                detail = (
+                    "Display protection off · ready to mirror"
+                    if guard_status == "disabled"
+                    else None
+                )
+                self._set_mirror_state("ready", detail)
         elif guard_status == "failed":
-            self._set_mirror_state(
-                "guard_failed",
-                self._guard_failure_reason_by_serial.get(
-                    serial, "Display protection must be retried"),
-            )
+            if self._mirror_state in ("stopped", "failed"):
+                self._set_mirror_state(
+                    "ready", "Ready · turn display processing off manually")
 
     def _finish_initial_guard(self, serial, generation, success):
         if self._closing or generation != self._guard_generation:
@@ -1376,30 +1831,27 @@ class CdcV2Window(v1.CdcMainWindow):
             return
         outcome = self._guard_status_by_serial.get(serial)
         if success and outcome in ("protected", "not_applicable"):
-            self._set_mirror_state(
-                "protecting", "Display baseline ready · detecting stream engine…")
-            self._start_stream_capability_probe(serial)
+            self.ai_pq_status_label.setToolTip("")
+            if self._mirror_state in ("stopped", "ready", "failed"):
+                self._set_mirror_state("ready", "Display protected · ready to mirror")
             return
         reason = self._guard_failure_reason_by_serial.get(
             serial, "Display protection could not be verified")
-        self._set_mirror_state("guard_failed", reason)
-
-    def _retry_initial_guard(self):
-        serial = self.active_serial()
-        if not serial:
-            return
-        self._guard_generation += 1
-        generation = self._guard_generation
-        self._guard_status_by_serial[serial] = "protecting"
-        self._set_ai_pq_status("Retrying rooted display protection…", "pending")
-        self._set_mirror_state(
-            "protecting", "Retrying display protection before mirroring…")
-        self.enforce_ai_pq_off(
-            silent=True,
-            on_complete=lambda success, target=serial, token=generation:
-                self._finish_initial_guard(target, token, success),
-            apply_all=True,
+        self._set_ai_pq_status(
+            "Display protection failed · turn display processing off manually",
+            "error",
         )
+        self.ai_pq_status_label.setToolTip(reason)
+        self.logline(
+            f"[AI-PQ] {serial}: display protection failed ({reason}). "
+            "Mirror remains available; switch display processing off manually."
+        )
+        if self._mirror_state in ("stopped", "ready", "failed"):
+            self._set_mirror_state(
+                "ready", "Ready · turn display processing off manually")
+        elif self._mirror_state == "running":
+            self.start_button_widget.setToolTip(
+                "Mirror is live · turn display processing off manually")
 
     def _preset_combo_changed(self, index):
         name = self.profile_combo.itemData(int(index))
@@ -1619,11 +2071,18 @@ class CdcV2Window(v1.CdcMainWindow):
             self.logline(
                 f"[Stream] {serial}: {capabilities.width}x{capabilities.height} "
                 f"@ {capabilities.refresh_hz:g} Hz · {capabilities.h264_encoder}.")
-        if (
-                self._mirror_state == "protecting"
-                and self._guard_status_by_serial.get(serial)
-                in ("protected", "not_applicable")):
-            self._set_mirror_state("ready", "Device protected · ready to mirror")
+        if self._mirror_state in ("stopped", "ready", "failed"):
+            guard_status = self._guard_status_by_serial.get(serial)
+            detail = (
+                "Ready · turn display processing off manually"
+                if guard_status == "failed"
+                else (
+                    "Device ready · display protection off"
+                    if guard_status == "disabled"
+                    else "Device ready to mirror"
+                )
+            )
+            self._set_mirror_state("ready", detail)
 
     @staticmethod
     def _build_scrcpy_command(serial, title, config):
@@ -1654,8 +2113,6 @@ class CdcV2Window(v1.CdcMainWindow):
     def _toggle_mirror(self):
         if self._mirror_state == "running":
             self.stop_scrcpy()
-        elif self._mirror_state == "guard_failed":
-            self._retry_initial_guard()
         elif self._mirror_state in ("ready", "stopped", "failed"):
             self.start_scrcpy()
 
@@ -1669,12 +2126,6 @@ class CdcV2Window(v1.CdcMainWindow):
             "ready": (
                 "Start mirror", "primary", serial_ready,
                 f"{self.selected_preset} · ready", "idle"),
-            "protecting": (
-                "Protecting…", "quiet", False,
-                "Securing display settings…", "pending"),
-            "guard_failed": (
-                "Retry protection", "warning", serial_ready,
-                "Display protection failed", "error"),
             "starting": ("Starting…", "primary", False, "Starting mirror…", "pending"),
             "running": ("Stop mirror", "danger", True, "Live", "online"),
             "stopping": ("Stopping…", "danger", False, "Stopping mirror…", "pending"),
@@ -1698,12 +2149,6 @@ class CdcV2Window(v1.CdcMainWindow):
         serial = self.require_serial()
         if not serial:
             self._set_mirror_state("stopped")
-            return
-        guard_status = self._guard_status_by_serial.get(serial)
-        if guard_status not in ("protected", "not_applicable"):
-            reason = self._guard_failure_reason_by_serial.get(
-                serial, "Display protection must complete before mirroring")
-            self._set_mirror_state("guard_failed", reason)
             return
         if self.scrcpy_proc and self.scrcpy_proc.poll() is None:
             self._set_mirror_state("running", "Mirror is already running")
@@ -1989,7 +2434,7 @@ class CdcV2Window(v1.CdcMainWindow):
             self._focus_restore = {
                 "maximized": self.isMaximized(),
                 "geometry": self.saveGeometry(),
-                "menu": False,
+                "menu": self.menuBar().isVisible(),
                 "sidebar": self.sidebar.isVisible(),
                 "console": not self._console_collapsed,
                 "main": self.main_splitter.saveState(),
@@ -2001,6 +2446,7 @@ class CdcV2Window(v1.CdcMainWindow):
             self.sidebar.hide()
             self.console.hide()
             self.showFullScreen()
+            self._sync_focus_action()
         else:
             self.exit_focus_mode()
 
@@ -2015,11 +2461,14 @@ class CdcV2Window(v1.CdcMainWindow):
             self.restoreGeometry(geometry)
         if restore.get("maximized", True):
             self.showMaximized()
-        self.menuBar().setVisible(bool(restore.get("menu", False)))
+        # Focus mode is the only thing that hides the menu bar, so leaving it
+        # hidden on exit would strand the user with no menus at all.
+        self.menuBar().setVisible(True)
         self.app_bar.show()
         self.console.show()
         self._set_sidebar_visible(restore.get("sidebar", True), persist=False)
         self._set_console_visible(restore.get("console", True), persist=False)
+        self._sync_focus_action()
 
         def restore_splitters():
             if restore.get("main"):
@@ -2029,11 +2478,19 @@ class CdcV2Window(v1.CdcMainWindow):
 
         QTimer.singleShot(0, restore_splitters)
 
+    def _sync_focus_action(self):
+        action = getattr(self, "focus_action", None)
+        if action is not None and action.isChecked() != self._focus_mode:
+            action.blockSignals(True)
+            action.setChecked(self._focus_mode)
+            action.blockSignals(False)
+        button = getattr(self, "header_focus_button", None)
+        if button is not None:
+            button.setText("Exit full screen" if self._focus_mode else "Full screen")
+
     def _escape_focus(self):
         if self._focus_mode:
             self.exit_focus_mode()
-        elif self.menuBar().isVisible():
-            self._hide_menu_bar()
 
     # ---------- authoritative RK3576 display guard ----------
     def _set_ai_pq_status(self, text, tone="idle"):
@@ -2527,7 +2984,7 @@ class CdcV2Window(v1.CdcMainWindow):
         return sync_result.changed_keys
 
     def _ai_pq_watchdog(self):
-        if self.active_serial():
+        if self._display_protection_enabled and self.active_serial():
             self.enforce_ai_pq_off(silent=True)
 
     @staticmethod
@@ -2538,10 +2995,10 @@ class CdcV2Window(v1.CdcMainWindow):
     def _protected_plan_status(plan):
         supported_count = len(plan.supported_toggle_specs)
         if plan.capability is CapabilityLevel.FULL:
-            return "Automatic · 7/7 protected", "online"
+            return "Protected · 7/7 controls off", "online"
         if plan.capability is CapabilityLevel.PARTIAL:
             return (
-                f"Automatic · {supported_count}/7 supported controls protected",
+                f"Protected · {supported_count}/7 supported controls off",
                 "pending",
             )
         return "Not available on this firmware", "idle"
@@ -2739,6 +3196,10 @@ class CdcV2Window(v1.CdcMainWindow):
 
     def enforce_ai_pq_off(
             self, silent=False, on_complete=None, apply_all=False):
+        if apply_all and not self._display_protection_enabled:
+            if on_complete:
+                self.ui(on_complete, True)
+            return
         serial = self.active_serial()
         if not serial:
             if not silent:
@@ -2758,6 +3219,9 @@ class CdcV2Window(v1.CdcMainWindow):
         def job():
             success = False
             try:
+                if apply_all and not self._display_protection_enabled:
+                    success = True
+                    return
                 result, values = self._read_ai_pq_state(serial)
                 if result[0] != 0:
                     detail = self._adb_result_output(result) or "ADB/tunnel read failed"
@@ -2777,6 +3241,10 @@ class CdcV2Window(v1.CdcMainWindow):
                         self._set_ai_pq_status,
                         "Not applicable · supported display controls were not found",
                         "idle")
+                    success = True
+                    return
+
+                if apply_all and not self._display_protection_enabled:
                     success = True
                     return
 
@@ -2856,9 +3324,6 @@ class CdcV2Window(v1.CdcMainWindow):
         if event.isAccepted():
             self._closing = True
             self._mirror_generation += 1
-            app = QApplication.instance()
-            if app is not None:
-                app.removeEventFilter(self)
         else:
             self._closing = False
 
@@ -2868,7 +3333,7 @@ def main():
     if os.name == "nt":
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "Convrse.DeviceControl.V2.3")
+                "Convrse.DeviceControl.V2.3.4")
         except Exception:
             pass
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -2889,3 +3354,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

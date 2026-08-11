@@ -12,8 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
-from PySide6.QtGui import QWheelEvent
+from PySide6.QtCore import QMetaMethod, QPoint, QPointF, QSettings, Qt
+from PySide6.QtGui import QKeySequence, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
@@ -230,26 +230,23 @@ class CdcV2Tests(unittest.TestCase):
             "V2", [label.text() for label in window.findChildren(cdc_v2.QLabel)]
         )
 
-    def test_alt_toggles_the_hidden_menu_bar(self):
+    def test_menu_bar_stays_visible_and_survives_interaction(self):
+        """The auto-hiding menu bar is gone, and with it the dead menu clicks.
+
+        V2.3 hid the bar and re-showed it on Alt, policed by an application
+        event filter.  That filter treated any mouse press it could not resolve
+        to a QWidget as a click outside the menu -- and Qt delivers real mouse
+        input through the popup's QWindow -- so every menu click closed the menu
+        before the action fired.
+        """
         window = self._window()
-        self.assertFalse(window.menuBar().isVisible())
+        self.assertTrue(window.menuBar().isVisible())
 
         QTest.keyClick(window, Qt.Key.Key_Alt)
         self._drain_events()
         self.assertTrue(window.menuBar().isVisible())
 
-        QTest.keyClick(window, Qt.Key.Key_Escape)
-        self._drain_events()
-        self.assertFalse(window.menuBar().isVisible())
-
-        QTest.keyClick(window, Qt.Key.Key_Alt)
-        self._drain_events()
-        self.assertTrue(window.menuBar().isVisible())
         QTest.mouseClick(window.mirror_frame, Qt.MouseButton.LeftButton)
-        self._drain_events()
-        self.assertFalse(window.menuBar().isVisible())
-
-        QTest.keyClick(window, Qt.Key.Key_Alt)
         self._drain_events()
         self.assertTrue(window.menuBar().isVisible())
 
@@ -259,14 +256,114 @@ class CdcV2Tests(unittest.TestCase):
         )
         refresh_action.trigger()
         self._drain_events()
-        self.assertFalse(window.menuBar().isVisible())
+        self.assertTrue(window.menuBar().isVisible())
 
-        QTest.keyClick(window, Qt.Key.Key_Alt)
+        # Escape no longer hides the menus; it only leaves focus mode.
+        QTest.keyClick(window, Qt.Key.Key_Escape)
         self._drain_events()
         self.assertTrue(window.menuBar().isVisible())
-        QTest.keyClick(window, Qt.Key.Key_Alt)
+
+    def test_menu_shortcuts_fire_without_the_menu_being_open(self):
+        """Menu-bar accelerators were dead because the bar was hidden.
+
+        A QAction only receives its shortcut while a widget it belongs to is
+        visible, so Ctrl+B, Ctrl+J, F5 and the rest never fired in normal use.
+        Registering each action on the window fixes it.
+        """
+        window = self._window()
+
+        before = window.sidebar.isVisible()
+        QTest.keySequence(window, QKeySequence("Ctrl+B"))
         self._drain_events()
-        self.assertFalse(window.menuBar().isVisible())
+        self.assertNotEqual(before, window.sidebar.isVisible())
+        self.assertEqual(
+            window.sidebar_action.isChecked(), window.sidebar.isVisible())
+
+        before = window._console_collapsed
+        QTest.keySequence(window, QKeySequence("Ctrl+J"))
+        self._drain_events()
+        self.assertNotEqual(before, window._console_collapsed)
+        self.assertEqual(
+            window.console_action.isChecked(), not window._console_collapsed)
+
+    def test_view_check_marks_track_the_real_panel_state(self):
+        window = self._window()
+
+        window._set_sidebar_visible(False)
+        self._drain_events()
+        self.assertFalse(window.sidebar_action.isChecked())
+        window._set_sidebar_visible(True)
+        self._drain_events()
+        self.assertTrue(window.sidebar_action.isChecked())
+
+        window._set_console_visible(False)
+        self._drain_events()
+        self.assertFalse(window.console_action.isChecked())
+        window._set_console_visible(True)
+        self._drain_events()
+        self.assertTrue(window.console_action.isChecked())
+
+    def test_every_menu_action_is_connected(self):
+        window = self._window()
+        unwired = []
+        for menu_action in window.menuBar().actions():
+            menu = menu_action.menu()
+            self.assertIsNotNone(menu, menu_action.text())
+            for action in menu.actions():
+                if action.isSeparator():
+                    continue
+                signal = QMetaMethod.fromSignal(action.triggered)
+                if not action.isSignalConnected(signal):
+                    unwired.append(action.text())
+        self.assertEqual(unwired, [])
+
+    def test_display_protection_is_user_controlled_off_by_default_and_persists(self):
+        window = self._window()
+        action = window.display_protection_action
+        # The check mark is the state; the label no longer repeats it as ON/OFF
+        # where the two could disagree.
+        self.assertEqual(action.text(), "Display protection")
+        self.assertTrue(action.isCheckable())
+        self.assertFalse(action.isChecked())
+
+        action.trigger()
+        self._drain_events()
+
+        self.assertTrue(window._display_protection_enabled)
+        self.assertTrue(
+            window._bool_value(
+                window.settings.value("device/display_protection_enabled"),
+                False,
+            )
+        )
+        self.assertTrue(action.isChecked())
+        self.assertIn("user enabled", window.status_label.text())
+
+        action.trigger()
+        self._drain_events()
+
+        self.assertFalse(window._display_protection_enabled)
+        self.assertFalse(action.isChecked())
+        self.assertFalse(action.isChecked())
+        self.assertIn("direct mirror", window.status_label.text())
+
+    def test_disabled_display_protection_skips_guard_and_keeps_mirror_ready(self):
+        window = self._window()
+        serial = "manual-display-device"
+        window._set_display_protection_enabled(False)
+
+        with mock.patch.object(window, "enforce_ai_pq_off") as enforce, \
+                mock.patch.object(window, "_start_stream_capability_probe") as probe, \
+                mock.patch.object(window, "active_serial", return_value=serial):
+            window._device_changed(serial)
+            window._ai_pq_watchdog()
+
+        enforce.assert_not_called()
+        probe.assert_called_once_with(serial)
+        self.assertEqual(window._guard_status_by_serial[serial], "disabled")
+        self.assertEqual(window._mirror_state, "ready")
+        self.assertTrue(window.start_button_widget.isEnabled())
+        self.assertIn("protection off", window.mirror_status_label.text())
 
     def test_preset_combo_is_exact_and_persists(self):
         window = self._window()
@@ -753,8 +850,9 @@ class CdcV2Tests(unittest.TestCase):
         self.assertNotIn("Open display", device_page_text)
         self.assertNotIn("Enforce", device_page_text)
 
-    def test_new_device_invokes_full_automatic_guard_once(self):
+    def test_new_device_invokes_full_user_enabled_guard_once(self):
         window = self._window()
+        window._display_protection_enabled = True
         window._ai_guard_last_serial = None
 
         with mock.patch.object(window, "enforce_ai_pq_off") as enforce:
@@ -771,7 +869,7 @@ class CdcV2Tests(unittest.TestCase):
             window._device_changed("RK3576-USB-004")
             self.assertEqual(enforce.call_count, 1)
 
-            # Any other opaque serial gets its own automatic full baseline.
+            # Any other opaque serial gets its own user-enabled full baseline.
             window._device_changed("display-lab-b.local:5555")
             self.assertEqual(enforce.call_count, 2)
             self.assertTrue(enforce.call_args.kwargs["silent"])
@@ -780,6 +878,7 @@ class CdcV2Tests(unittest.TestCase):
 
     def test_generic_firmware_skips_root_and_setprop_and_reports_unsupported(self):
         window = self._window()
+        window._display_protection_enabled = True
         serial = "generic-android-usb"
         generic_snapshot = {"ro.board.platform": "generic"}
 
@@ -844,8 +943,9 @@ class CdcV2Tests(unittest.TestCase):
         self.assertEqual(window.ai_toggle_labels["AI-DC"].text(), "ON · cached")
         self.assertEqual(window._guard_status_by_serial[serial], "failed")
 
-    def test_mirror_is_gated_until_initial_guard_finishes(self):
+    def test_mirror_is_available_while_initial_guard_runs_and_after_failure(self):
         window = self._window()
+        window._display_protection_enabled = True
         serial = "guard-first-rk"
         with mock.patch.object(window, "enforce_ai_pq_off") as enforce, \
                 mock.patch.object(window, "_start_stream_capability_probe") as probe, \
@@ -854,24 +954,37 @@ class CdcV2Tests(unittest.TestCase):
                 ), \
                 mock.patch.object(window, "active_serial", return_value=serial):
             window._device_changed(serial)
-            self.assertEqual(window._mirror_state, "protecting")
-            self.assertFalse(window.start_button_widget.isEnabled())
-            completion = enforce.call_args.kwargs["on_complete"]
-
-            window._guard_status_by_serial[serial] = "protected"
-            completion(True)
-            probe.assert_called_once_with(serial)
-
-            capabilities = cdc_v2.DeviceStreamCapabilities(
-                width=1920,
-                height=1080,
-                refresh_hz=60,
-                h264_encoder="c2.rk.avc.encoder",
-            )
-            window._apply_stream_capabilities(
-                serial, window._stream_probe_generation, capabilities)
             self.assertEqual(window._mirror_state, "ready")
             self.assertTrue(window.start_button_widget.isEnabled())
+            probe.assert_called_once_with(serial)
+            completion = enforce.call_args.kwargs["on_complete"]
+
+            window._guard_status_by_serial[serial] = "failed"
+            window._guard_failure_reason_by_serial[serial] = "Root access unavailable"
+            completion(False)
+            self.assertEqual(window._mirror_state, "ready")
+            self.assertTrue(window.start_button_widget.isEnabled())
+            self.assertIn("manually", window.mirror_status_label.text())
+            self.assertIn("manually", window.ai_pq_status_label.text())
+            self.assertEqual(
+                window.ai_pq_status_label.toolTip(), "Root access unavailable")
+
+    def test_guard_failure_never_blocks_scrcpy_start(self):
+        window = self._window()
+        serial = "guard-failed-rk"
+        process = FakeProcess()
+        window.worker = lambda _callback: None
+        window.after = lambda *_args, **_kwargs: None
+        window._guard_status_by_serial[serial] = "failed"
+        window._guard_failure_reason_by_serial[serial] = "Root access unavailable"
+
+        with mock.patch.object(window, "require_serial", return_value=serial), \
+                mock.patch.object(cdc_v2.subprocess, "Popen", return_value=process) as popen:
+            window.start_scrcpy()
+
+        popen.assert_called_once()
+        self.assertIs(window.scrcpy_proc, process)
+        self.assertEqual(window._mirror_state, "starting")
 
     def test_root_failure_exposes_actionable_reason(self):
         window = self._window()
@@ -905,6 +1018,7 @@ class CdcV2Tests(unittest.TestCase):
 
     def test_full_connection_baseline_writes_every_supported_property(self):
         window = self._window()
+        window._display_protection_enabled = True
         serial = "10.42.0.18:5555"
         snapshot = build_off_property_map()
 
@@ -946,13 +1060,14 @@ class CdcV2Tests(unittest.TestCase):
         self.assertEqual(written, snapshot)
         sync_preferences.assert_called_once_with(
             serial, "adb", refresh_for_runtime_change=True)
-        self.assertTrue(
-            window.ai_pq_status_label.text().startswith("Automatic")
+        self.assertEqual(
+            window.ai_pq_status_label.text(),
+            "Protected · 7/7 controls off",
         )
-        self.assertIn("7/7 protected", window.ai_pq_status_label.text())
 
     def test_watchdog_writes_corrections_only(self):
         window = self._window()
+        window._display_protection_enabled = True
         serial = "watchdog-rk3576"
         drifted_snapshot = build_off_property_map()
         drifted_snapshot["persist.vendor.sculptor.mode"] = "1"
@@ -1006,6 +1121,7 @@ class CdcV2Tests(unittest.TestCase):
 
     def test_partial_watchdog_syncs_cache_without_runtime_corrections(self):
         window = self._window()
+        window._display_protection_enabled = True
         serial = "partial-rk-display"
         partial_snapshot = {"persist.vendor.sculptor.mode": "0"}
 
@@ -1043,7 +1159,7 @@ class CdcV2Tests(unittest.TestCase):
         self.assertEqual(self._setprop_calls(adb_command), [])
         sync_preferences.assert_called_once_with(
             serial, "adb", refresh_for_runtime_change=False)
-        self.assertIn("supported controls protected", window.ai_pq_status_label.text())
+        self.assertIn("supported controls off", window.ai_pq_status_label.text())
 
     def test_preference_sync_force_stops_and_reopens_foreground_settings(self):
         window = self._window()
@@ -1374,8 +1490,9 @@ class CdcV2Tests(unittest.TestCase):
         self.assertIn(("shell", "sync"), calls)
         self.assertIn(("shell", "rm", "-f", remote_stage), calls)
 
-    def test_automatic_guard_never_writes_preserved_face_capability_gate(self):
+    def test_full_guard_never_writes_preserved_face_capability_gate(self):
         window = self._window()
+        window._display_protection_enabled = True
         serial = "preserved-face-gate-rk3576"
         preserved_property = PRESERVED_FIRMWARE_PROPERTIES[0]
         snapshot = build_off_property_map()
