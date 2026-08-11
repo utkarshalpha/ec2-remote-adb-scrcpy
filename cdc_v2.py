@@ -65,6 +65,21 @@ APP_NAME = legacy.APP_NAME
 APP_VERSION = "2.4.0"
 
 
+def _offscreen_origin():
+    """A point past the bottom-right of every monitor.
+
+    A hardcoded 4000,4000 sits inside the desktop on a multi-monitor or 4K
+    setup, which is where an operator would see the scrcpy window appear on its
+    own before it is embedded.
+    """
+    try:
+        from PySide6.QtGui import QGuiApplication
+        geometry = QGuiApplication.primaryScreen().virtualGeometry()
+        return geometry.right() + 200, geometry.bottom() + 200
+    except Exception:
+        return 4000, 4000
+
+
 def _qt_version():
     try:
         from PySide6 import __version__ as pyside_version
@@ -2280,8 +2295,16 @@ class CdcV2Window(v1.CdcMainWindow):
             "--print-fps",
             "--window-title", title,
             "--window-borderless",
-            "--window-x", "4000",
-            "--window-y", "4000",
+        ])
+        # Ask for a position past the far corner of the whole desktop so the
+        # window has the best chance of never being painted where the operator
+        # can see it.  SDL may clamp this onto a real display, which is why the
+        # window is also hidden the moment it is found and only shown again once
+        # it lives inside the mirror frame.
+        offset_x, offset_y = _offscreen_origin()
+        command.extend([
+            "--window-x", str(offset_x),
+            "--window-y", str(offset_y),
         ])
         return command
 
@@ -2504,6 +2527,14 @@ class CdcV2Window(v1.CdcMainWindow):
                 return
             hwnd = self._find_scrcpy_hwnd(proc, title)
             if hwnd:
+                # scrcpy is launched off the desktop, but SDL clamps a window
+                # onto the nearest display, so it becomes briefly visible as a
+                # separate window before Qt re-parents it.  Hide it the instant
+                # it exists; adopt_window shows it again inside the mirror frame.
+                try:
+                    legacy._USER32.ShowWindow(int(hwnd), 0)  # SW_HIDE
+                except Exception:
+                    pass
                 break
             time.sleep(0.1)
         if not hwnd:
