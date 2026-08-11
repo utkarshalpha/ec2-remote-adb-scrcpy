@@ -1838,7 +1838,17 @@ class CdcV2Window(v1.CdcMainWindow):
         self.logline(f"[ADB] connect {target}: {result[1] or 'no response'}")
         output = (result[1] or "").lower()
         if result[0] != 0 or not ("connected" in output or "already" in output):
-            self._fail_tunnel(f"ADB could not attach to {target}.")
+            # The forward opened, so SSH and the key are fine and the gateway
+            # accepted the connection.  The device behind it did not answer.
+            # In the field this is nearly always an expired lease: the tunnel
+            # auto-expires, the local socket keeps accepting, and only the ADB
+            # handshake reveals that nothing is on the other end.
+            self._fail_tunnel(
+                f"The tunnel to port {self.ssh_remote_port} opened, but the "
+                "device did not answer.\n\n"
+                "This usually means the tunnel has expired. Open a fresh one "
+                "for this device on the CDM website and use the new port it "
+                "shows — it will not be the same number.")
             return
 
         identity = self._read_device_identity(target)
