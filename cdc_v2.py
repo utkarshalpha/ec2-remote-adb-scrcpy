@@ -1933,7 +1933,7 @@ class CdcV2Window(v1.CdcMainWindow):
                 f"[Device] {identity.label()}"
                 + (f" · {identity.model}" if identity.model else "")
                 + (f" · Android {identity.android}" if identity.android else ""))
-            self.ui(self.device_pill.setText, identity.label())
+            self.ui(self._show_identity, identity)
 
         self.ui(
             self._set_tunnel_state,
@@ -1944,6 +1944,11 @@ class CdcV2Window(v1.CdcMainWindow):
         # to device. Poll for it instead of leaving the operator to press
         # Refresh until something shows up.
         self.ui(self._start_device_watch, target)
+
+    def _show_identity(self, identity):
+        """Put the serial where it can be compared against the CDM website."""
+        self.device_pill.setText(identity.label())
+        self.device_pill.setToolTip(identity.details())
 
     def _start_device_watch(self, target):
         """Keep refreshing until the device shows up, then stop.
@@ -1989,6 +1994,16 @@ class CdcV2Window(v1.CdcMainWindow):
             return
         self.worker(lambda: self._refresh_devices_job(preferred=target))
 
+    # Candidate properties for the project label the CDM website shows beside
+    # the serial. None is guaranteed to exist; the serial alone already answers
+    # "am I on the right device", so a miss costs nothing.
+    _PROJECT_PROPERTY_KEYS = (
+        "persist.convrse.project",
+        "persist.convrse.site",
+        "persist.sys.convrse.project",
+        "ro.convrse.project",
+    )
+
     def _read_device_identity(self, serial):
         """Ask the device who it is. This is what makes a stale port harmless."""
         props = {}
@@ -2000,11 +2015,21 @@ class CdcV2Window(v1.CdcMainWindow):
             props[key] = (out or "").strip() if rc == 0 else ""
         if not any(props.values()):
             return None
+        project = ""
+        for key in self._PROJECT_PROPERTY_KEYS:
+            rc, out, _elapsed = legacy.adb_command(
+                "shell", "getprop", key, serial=serial, timeout=10,
+                telemetry=False)
+            value = (out or "").strip() if rc == 0 else ""
+            if value:
+                project = value
+                break
         return conn.DeviceIdentity(
             serial=props.get("ro.serialno", ""),
             model=props.get("ro.product.model", ""),
             name=props.get("ro.product.device", ""),
             android=props.get("ro.build.version.release", ""),
+            project=project,
         )
 
     def disconnect_tunnel(self):
@@ -2062,8 +2087,11 @@ class CdcV2Window(v1.CdcMainWindow):
     def _device_changed(self, serial):
         serial = (serial or "").strip()
         identity = self._connected_identity
-        self.device_pill.setText(
-            identity.label() if (serial and identity) else (serial or "No device"))
+        if serial and identity:
+            self._show_identity(identity)
+        else:
+            self.device_pill.setText(serial or "No device")
+            self.device_pill.setToolTip("")
 
         # A live transport can have arrived two ways, and both are legitimate.
         # When this app opened the tunnel, ADB addresses the device by our

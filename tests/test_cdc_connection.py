@@ -194,14 +194,35 @@ class RouteDescriptionTests(unittest.TestCase):
 
 
 class DeviceIdentityTests(unittest.TestCase):
-    def test_label_prefers_name_and_serial(self):
+    def test_label_matches_what_the_portal_shows(self):
+        """The website shows 'SN2026020201959 / neopolis'; so do we."""
         identity = conn.DeviceIdentity(
-            serial="SN2026032301215", model="RK3588", name="MP_Meeting_Room_5")
-        self.assertEqual(identity.label(), "MP_Meeting_Room_5 · SN2026032301215")
+            serial="SN2026020201959", model="H96_Max_M9",
+            name="rk3576_box", project="neopolis")
+        self.assertEqual(identity.label(), "SN2026020201959 / neopolis")
 
-    def test_falls_back_to_serial_then_model(self):
-        self.assertEqual(conn.DeviceIdentity(serial="ABC").label(), "ABC")
-        self.assertEqual(conn.DeviceIdentity(model="RK3588").label(), "RK3588")
+    def test_serial_leads_even_without_a_project(self):
+        identity = conn.DeviceIdentity(
+            serial="SN2026020201959", model="H96_Max_M9", name="rk3576_box")
+        self.assertEqual(identity.label(), "SN2026020201959")
+
+    def test_hardware_name_never_masks_the_serial(self):
+        """rk3576_box is identical on every unit, so it cannot lead."""
+        identity = conn.DeviceIdentity(
+            serial="SN2026020201959", name="rk3576_box")
+        self.assertTrue(identity.label().startswith("SN2026020201959"))
+        self.assertNotIn("rk3576_box", identity.label())
+
+    def test_falls_back_to_model_when_there_is_no_serial(self):
+        self.assertEqual(conn.DeviceIdentity(model="H96_Max_M9").label(), "H96_Max_M9")
+
+    def test_details_carry_everything_for_the_tooltip(self):
+        identity = conn.DeviceIdentity(
+            serial="SN1", model="H96", name="rk3576_box",
+            android="14.0.1", project="neopolis")
+        details = identity.details()
+        for expected in ("SN1", "neopolis", "H96", "rk3576_box", "14.0.1"):
+            self.assertIn(expected, details)
 
     def test_empty_identity_is_falsey(self):
         self.assertFalse(conn.DeviceIdentity())

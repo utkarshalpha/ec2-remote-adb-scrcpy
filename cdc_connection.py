@@ -296,23 +296,46 @@ def describe_route(local_port: int | None, remote_port: int | None, host: str) -
 class DeviceIdentity:
     """What actually answered on the other end of the tunnel."""
 
-    __slots__ = ("serial", "model", "name", "android")
+    __slots__ = ("serial", "model", "name", "android", "project")
 
-    def __init__(self, serial="", model="", name="", android=""):
+    def __init__(self, serial="", model="", name="", android="", project=""):
         self.serial = serial
         self.model = model
         self.name = name
         self.android = android
+        self.project = project
 
     def __bool__(self):
         return bool(self.serial or self.model)
 
     def label(self) -> str:
-        if self.name and self.serial:
-            return f"{self.name} · {self.serial}"
+        """Lead with the serial, because that is what the CDM website shows.
+
+        The operator's check is "am I on the device I opened a tunnel for?", and
+        the answer is on the portal as ``SN2026020201959 / neopolis``.  Leading
+        with the hardware name instead put ``rk3576_box`` -- identical on every
+        unit in the fleet -- where the distinguishing value should be.
+        """
+        if self.serial and self.project:
+            return f"{self.serial} / {self.project}"
         if self.serial:
             return self.serial
         return self.model or "Unidentified device"
+
+    def details(self) -> str:
+        """Everything known, for a tooltip."""
+        parts = []
+        if self.serial:
+            parts.append(f"Serial: {self.serial}")
+        if self.project:
+            parts.append(f"Project: {self.project}")
+        if self.model:
+            parts.append(f"Model: {self.model}")
+        if self.name:
+            parts.append(f"Hardware: {self.name}")
+        if self.android:
+            parts.append(f"Android: {self.android}")
+        return "\n".join(parts)
 
     def __repr__(self):
         return f"DeviceIdentity(serial={self.serial!r}, model={self.model!r})"
