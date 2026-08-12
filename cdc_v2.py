@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 import cdc_connection as conn
+import cdc_health as health
 import cdc_qt as v1
 import scrcpy_remote as legacy
 from cdc_ai_guard import (
@@ -623,6 +624,8 @@ class CdcV2Window(v1.CdcMainWindow):
         self._device_watch_ticks = 0
         # ADB address -> DeviceIdentity, so the list can show names.
         self._identity_by_address = {}
+        self._last_health_result = None
+        self._health_recheck_pending = False
 
         self._build_menus()
 
@@ -937,7 +940,7 @@ class CdcV2Window(v1.CdcMainWindow):
         self.category_stack.addWidget(self._category_page(
             self._remote_card(), self._recovery_card()))
         self.category_stack.addWidget(self._category_page(
-            self._ai_pq_card_v2(), self._tools_card()))
+            self._health_card(), self._ai_pq_card_v2(), self._tools_card()))
         content_layout.addWidget(self.category_stack)
         content_layout.addStretch(1)
         scroll.setWidget(content)
@@ -1223,6 +1226,161 @@ class CdcV2Window(v1.CdcMainWindow):
         ], columns=2))
         self._disclosure(layout, "More recovery", more)
         return card
+
+    def _health_card(self):
+        """The morning check: one device, one verdict, one click to act on it."""
+        card, layout = self._card("Morning check")
+
+        self.health_status_label = v1._label(
+            "Connect a device and run the check", "AiStatus")
+        self.health_status_label.setProperty("tone", "idle")
+        self.health_status_label.setWordWrap(True)
+        layout.addWidget(self.health_status_label)
+
+        self.health_detail_label = v1._label("", "Tertiary")
+        self.health_detail_label.setWordWrap(True)
+        self.health_detail_label.hide()
+        layout.addWidget(self.health_detail_label)
+
+        self.health_run_button = _role(QPushButton("Run check"), "primary")
+        self.health_run_button.setToolTip(
+            "Look at what this device is doing: which app is in front, whether "
+            "the picture is moving, and whether a dialog is covering it")
+        self.health_run_button.clicked.connect(
+            lambda _checked=False: self.run_health_check())
+        layout.addWidget(self.health_run_button)
+
+        # Shown only when the check found something, so the panel stays quiet
+        # on a healthy device.
+        self.health_actions = QWidget()
+        action_layout = QHBoxLayout(self.health_actions)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(6)
+        self.health_mirror_button = _role(QPushButton("Open mirror"), "warning")
+        self.health_mirror_button.setToolTip(
+            "Take a look yourself on this already-verified session")
+        self.health_mirror_button.clicked.connect(
+            lambda _checked=False: self._health_open_mirror())
+        self.health_confirm_button = _role(QPushButton("This is correct"), "quiet")
+        self.health_confirm_button.setToolTip(
+            "Remember the app now in front as the one expected on this device")
+        self.health_confirm_button.clicked.connect(
+            lambda _checked=False: self._health_confirm_baseline())
+        action_layout.addWidget(self.health_mirror_button)
+        action_layout.addWidget(self.health_confirm_button)
+        self.health_actions.hide()
+        layout.addWidget(self.health_actions)
+        return card
+
+    def _health_expected_package(self, serial):
+        return self.settings.value(f"health/expected/{serial}", "", str)
+
+    def _set_health_status(self, text, tone="idle", detail=""):
+        self.health_status_label.setText(text)
+        self.health_status_label.setProperty("tone", tone)
+        _repolish(self.health_status_label)
+        self.health_detail_label.setText(detail)
+        self.health_detail_label.setVisible(bool(detail))
+
+    def run_health_check(self):
+        address = self.active_serial()
+        if not address:
+            QMessageBox.information(
+                self, APP_NAME,
+                "Connect a device first, then run the check.")
+            return
+        identity = self._identity_by_address.get(address)
+        serial = identity.serial if identity else address
+        expected = self._health_expected_package(serial)
+
+        self.health_run_button.setEnabled(False)
+        self.health_actions.hide()
+        self._set_health_status("Looking at the device…", "pending")
+
+        def job():
+            runner = health.AdbRunner(
+                address, legacy.adb_command,
+                screenshot_fn=lambda: self._grab_frame(address))
+            try:
+                result = health.run_health_check(
+                    runner, expected_package=expected, with_cleanup=True)
+            except Exception as exc:                       # pragma: no cover
+                self.ui(self._finish_health_check, None, str(exc))
+                return
+            self.ui(self._finish_health_check, result, "")
+
+        self.worker(job)
+
+    def _grab_frame(self, address):
+        """One screenshot, decoded in memory. Returns None if unavailable."""
+        try:
+            from io import BytesIO
+            from PIL import Image
+        except ImportError:                                 # pragma: no cover
+            return None
+        try:
+            code, raw, _stderr = self._adb_binary_command(
+                address, "exec-out", "screencap", "-p", timeout=30)
+        except Exception:
+            return None
+        if code != 0 or not raw:
+            return None
+        try:
+            return Image.open(BytesIO(raw)).convert("RGB")
+        except Exception:
+            # A device that refuses screencap still gets judged on the other
+            # signals; analyze_frames reports SCREENSHOT_UNAVAILABLE.
+            return None
+
+    def _finish_health_check(self, result, error):
+        self.health_run_button.setEnabled(True)
+        if error or result is None:
+            self._set_health_status(
+                "The check could not finish", "error", error)
+            self.logline(f"[Health] {error}")
+            return
+
+        self._last_health_result = result
+        tone = {
+            health.HEALTHY: "online",
+            health.UNCONFIRMED: "pending",
+            health.NEEDS_ATTENTION: "error",
+            health.OFFLINE: "error",
+        }.get(result.verdict, "idle")
+        detail = "\n".join(f"• {reason}" for reason in result.reasons)
+        self._set_health_status(f"{result.verdict} · {result.summary()}", tone, detail)
+        self.logline(f"[Health] {result.verdict}: {result.summary()}")
+        for reason in result.reasons:
+            self.logline(f"[Health]   {reason}")
+        self.logline("[Health] " + result.daily_check_detail().replace("\n", " | "))
+
+        # Offer the mirror when something is wrong, and the confirm action when
+        # the device looks fine but nobody has said what belongs in front.
+        show_mirror = result.needs_operator
+        show_confirm = (
+            result.verdict == health.UNCONFIRMED and bool(result.foreground_package))
+        self.health_mirror_button.setVisible(show_mirror)
+        self.health_confirm_button.setVisible(show_confirm)
+        self.health_actions.setVisible(show_mirror or show_confirm)
+
+    def _health_open_mirror(self):
+        """Hand the operator the screen on the session already verified."""
+        self._health_recheck_pending = True
+        if self._mirror_state != "running":
+            self.start_scrcpy()
+
+    def _health_confirm_baseline(self):
+        result = getattr(self, "_last_health_result", None)
+        if result is None or not result.foreground_package:
+            return
+        serial = result.serial or result.address
+        self.settings.setValue(
+            f"health/expected/{serial}", result.foreground_package)
+        self.settings.sync()
+        self.logline(
+            f"[Health] {result.foreground_package} recorded as expected on "
+            f"{serial}.")
+        self.run_health_check()
 
     def _tools_card(self):
         card, layout = self._card("Tools")
@@ -2552,7 +2710,15 @@ class CdcV2Window(v1.CdcMainWindow):
             self.start_scrcpy()
 
     def _set_mirror_state(self, state, detail=None):
+        was_running = self._mirror_state == "running"
         self._mirror_state = state
+        if (was_running and state in ("stopped", "ready", "failed")
+                and self._health_recheck_pending):
+            # The operator opened the mirror from the morning check, fixed
+            # whatever was wrong, and closed it. Re-check rather than making
+            # them remember to press the button again.
+            self._health_recheck_pending = False
+            QTimer.singleShot(1200, self.run_health_check)
         serial_ready = bool(self.active_serial())
         table = {
             "stopped": (
