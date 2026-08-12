@@ -506,13 +506,16 @@ class KeyImportDialog(QDialog):
         file_row = QHBoxLayout()
         self.file_edit = QLineEdit()
         self.file_edit.setPlaceholderText("Path to the .pem file")
-        self.file_edit.setEnabled(False)
         self.browse_button = QPushButton("Browse…")
-        self.browse_button.setEnabled(False)
         self.browse_button.clicked.connect(self._browse)
+        # Browse and the path box stay live whichever mode is selected. Greying
+        # them out until the radio above was ticked made Browse look broken --
+        # the operator's first instinct is to press Browse, not to pick a mode
+        # first, so pressing it simply switches to file mode.
         file_row.addWidget(self.file_edit, 1)
         file_row.addWidget(self.browse_button)
         layout.addLayout(file_row)
+        self.file_edit.textChanged.connect(self._path_typed)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
@@ -522,18 +525,24 @@ class KeyImportDialog(QDialog):
         layout.addWidget(buttons)
 
     def _sync_mode(self):
-        paste = self.paste_radio.isChecked()
-        self.mode = "paste" if paste else "file"
-        self.editor.setEnabled(paste)
-        self.file_edit.setEnabled(not paste)
-        self.browse_button.setEnabled(not paste)
+        self.mode = "paste" if self.paste_radio.isChecked() else "file"
+
+    def _path_typed(self, text):
+        """Typing or dropping a path is itself a choice of file mode."""
+        if text.strip() and not self.file_radio.isChecked():
+            self.file_radio.setChecked(True)
 
     def _browse(self):
+        start = self.file_edit.text().strip() or os.path.join(
+            os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(start):
+            start = os.path.dirname(start) or os.path.expanduser("~")
         path, _selected = QFileDialog.getOpenFileName(
-            self, "Select SSH private key", os.path.expanduser("~"),
+            self, "Select SSH private key", start,
             "PEM private key (*.pem);;All files (*.*)")
         if path:
             self.file_edit.setText(path)
+            self.file_radio.setChecked(True)
 
     def _accept(self):
         if self.mode == "file":

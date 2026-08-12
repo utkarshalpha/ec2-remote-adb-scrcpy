@@ -1628,3 +1628,34 @@ class GuardTimerTests(unittest.TestCase):
     def test_guard_is_paced_for_a_remote_link(self):
         window = self._window()
         self.assertGreaterEqual(window.ai_guard_timer.interval(), 15000)
+
+
+class KeyImportDialogTests(unittest.TestCase):
+    """Browse must work without picking a mode first."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_every_control_is_usable_immediately(self):
+        dialog = cdc_v2.KeyImportDialog()
+        self.addCleanup(dialog.deleteLater)
+        # Greying these out until the radio was ticked made Browse look broken.
+        self.assertTrue(dialog.browse_button.isEnabled())
+        self.assertTrue(dialog.file_edit.isEnabled())
+        self.assertTrue(dialog.editor.isEnabled())
+
+    def test_supplying_a_path_selects_file_mode(self):
+        dialog = cdc_v2.KeyImportDialog()
+        self.addCleanup(dialog.deleteLater)
+        self.assertTrue(dialog.paste_radio.isChecked())
+        dialog.file_edit.setText(r"C:\keys\cdm-key.pem")
+        self.assertTrue(dialog.file_radio.isChecked())
+        self.assertEqual(dialog.mode, "file")
+
+    def test_pasting_stays_in_paste_mode(self):
+        dialog = cdc_v2.KeyImportDialog()
+        self.addCleanup(dialog.deleteLater)
+        dialog.editor.setPlainText("-----BEGIN RSA PRIVATE KEY-----")
+        self.assertTrue(dialog.paste_radio.isChecked())
+        self.assertEqual(dialog.mode, "paste")
