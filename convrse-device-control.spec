@@ -63,13 +63,7 @@ analysis = Analysis(
     runtime_hooks=[],
     # Tcl/Tk is only referenced by the retired Tk shell, which scrcpy_remote
     # already guards with an ImportError fallback.
-    # Pillow imports numpy opportunistically, which dragged in 41 MB and tripled
-    # startup. The health check only uses Image.open, ImageChops.difference and
-    # ImageStat.Stat, none of which need it.
-    excludes=[
-        "tkinter", "_tkinter", "test", "unittest", "pydoc_data",
-        "numpy", "scipy", "matplotlib", "pandas",
-    ],
+    excludes=["tkinter", "_tkinter", "test", "unittest", "pydoc_data"],
     noarchive=False,
     optimize=0,
 )
