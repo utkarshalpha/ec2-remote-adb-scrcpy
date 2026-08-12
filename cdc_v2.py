@@ -621,6 +621,8 @@ class CdcV2Window(v1.CdcMainWindow):
         self._device_watch_timer = None
         self._device_watch_target = ""
         self._device_watch_ticks = 0
+        # ADB address -> DeviceIdentity, so the list can show names.
+        self._identity_by_address = {}
 
         self._build_menus()
 
@@ -1363,7 +1365,10 @@ class CdcV2Window(v1.CdcMainWindow):
         self.port_var = v1.ValueAdapter(self.port_edit.text, self.port_edit.setText)
         self.ip_var = v1.ValueAdapter(self.ip_edit.text, self.ip_edit.setText)
         self.key_var = v1.ValueAdapter(self.key_edit.text, self.key_edit.setText)
-        self.device_var = v1.ValueAdapter(self.device_combo.currentText, self._set_device)
+        # The combo shows a device name but every consumer expects the ADB
+        # address, so the adapter reads item data rather than the visible text.
+        self.device_var = v1.ValueAdapter(
+            self._current_device_serial, self._set_device)
         self.profile_var = PresetAdapter(self)
         self.current_app_var = v1.ValueAdapter(
             self.current_app_label.text, self.current_app_label.setText)
@@ -1377,7 +1382,8 @@ class CdcV2Window(v1.CdcMainWindow):
         self.capture_btn = CaptureButtonAdapter(self.capture_button_widget)
         self.start_btn = v1.ButtonAdapter(self.start_button_widget)
         self.device_box = v1.ComboAdapter(self.device_combo)
-        self.device_combo.currentTextChanged.connect(self._device_changed)
+        self.device_combo.currentIndexChanged.connect(
+            lambda _index: self._device_changed(self._current_device_serial()))
 
         self._migrate_legacy_key()
         self._sync_key_state()
@@ -1617,7 +1623,8 @@ class CdcV2Window(v1.CdcMainWindow):
 
     def _current_device_serial(self):
         if hasattr(self, "device_combo"):
-            return self.device_combo.currentText().strip()
+            # Item data is the ADB address; the visible text is the device name.
+            return (self.device_combo.currentData() or "").strip()
         return ""
 
     def _stream_capabilities_for(self, serial=None):
@@ -1944,6 +1951,78 @@ class CdcV2Window(v1.CdcMainWindow):
         # to device. Poll for it instead of leaving the operator to press
         # Refresh until something shows up.
         self.ui(self._start_device_watch, target)
+
+    # ---------- device list: names, not loopback addresses ----------
+    def _refresh_devices_job(self, preferred=None):
+        """List devices by who they are rather than by their ADB address.
+
+        ADB addresses a tunnelled device as 127.0.0.1:<local port>, which says
+        nothing about which device it is and changes every session. The list now
+        shows the serial the CDM website shows, keeping the address as item data
+        so everything downstream still receives what ADB expects.
+        """
+        rc, output, _elapsed = legacy.adb_command("devices", timeout=20)
+        addresses = []
+        if rc == 0:
+            for line in output.splitlines()[1:]:
+                fields = line.strip().split()
+                if len(fields) >= 2 and fields[1] == "device":
+                    addresses.append(fields[0])
+
+        for address in addresses:
+            if address not in self._identity_by_address:
+                identity = self._read_device_identity(address)
+                if identity:
+                    self._identity_by_address[address] = identity
+        # Drop identities for transports that have gone away, so a stale entry
+        # cannot keep a name alive after its tunnel closed.
+        for known in list(self._identity_by_address):
+            if known not in addresses:
+                self._identity_by_address.pop(known, None)
+
+        def update():
+            previous = self._current_device_serial()
+            self.devices = addresses
+            combo = self.device_combo
+            combo.blockSignals(True)
+            combo.clear()
+            for address in addresses:
+                identity = self._identity_by_address.get(address)
+                combo.addItem(identity.label() if identity else address, address)
+                if identity:
+                    combo.setItemData(
+                        combo.count() - 1, identity.details(),
+                        Qt.ItemDataRole.ToolTipRole)
+            combo.blockSignals(False)
+
+            target = None
+            for candidate in (preferred, previous):
+                if candidate and candidate in addresses:
+                    target = candidate
+                    break
+            if target is None and addresses:
+                target = addresses[0]
+            self._set_device(target or "")
+
+            if addresses:
+                self.status_var.set(f"{len(addresses)} device(s) connected")
+            else:
+                self.status_var.set("No authorized devices found")
+                if output and rc != 0:
+                    self.logline("[Devices] " + output)
+
+        self.ui(update)
+
+    def _set_device(self, value):
+        """Select by ADB address, which is the item data rather than the text."""
+        combo = self.device_combo
+        index = combo.findData(value) if value else -1
+        if index != combo.currentIndex():
+            combo.setCurrentIndex(index)
+        else:
+            # findData found the row already showing; still announce it so the
+            # rest of the window can react to a reconnect of the same device.
+            self._device_changed(value or "")
 
     def _show_identity(self, identity):
         """Put the serial where it can be compared against the CDM website."""

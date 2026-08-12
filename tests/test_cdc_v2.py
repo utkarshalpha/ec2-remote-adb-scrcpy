@@ -1659,3 +1659,109 @@ class KeyImportDialogTests(unittest.TestCase):
         dialog.editor.setPlainText("-----BEGIN RSA PRIVATE KEY-----")
         self.assertTrue(dialog.paste_radio.isChecked())
         self.assertEqual(dialog.mode, "paste")
+
+
+class DeviceListNamingTests(unittest.TestCase):
+    """The list shows who the device is; the app still acts on the ADB address."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(["cdc-device-list"])
+
+    def setUp(self):
+        temp = TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = str(Path(temp.name) / "device-list-test.ini")
+        settings = mock.patch.object(
+            cdc_v2, "QSettings",
+            side_effect=lambda *a, **k: QSettings(path, QSettings.Format.IniFormat))
+        settings.start()
+        self.addCleanup(settings.stop)
+        refresh = mock.patch.object(
+            cdc_v2.CdcV2Window, "refresh_devices", autospec=True)
+        refresh.start()
+        self.addCleanup(refresh.stop)
+
+    def _drain_events(self, cycles=4):
+        for _ in range(cycles):
+            self.app.processEvents()
+
+    def _window(self):
+        window = cdc_v2.CdcV2Window()
+        self.addCleanup(window.deleteLater)
+        self.addCleanup(window.close)
+        self.addCleanup(window.ai_guard_timer.stop)
+        self._drain_events()
+        return window
+
+    _DEVICES = (
+        "List of devices attached\n"
+        "127.0.0.1:49215\tdevice\n"
+        "127.0.0.1:49217\tdevice\n"
+    )
+    _IDENTITIES = {
+        "127.0.0.1:49215": ("SN2026020201959", "H96_Max_M9"),
+        "127.0.0.1:49217": ("SN2026020201148", "H96_Max_M9"),
+    }
+
+    def _populate(self, window, preferred=None):
+        import cdc_connection as conn
+
+        def fake_identity(_self, address):
+            found = self._IDENTITIES.get(address)
+            if not found:
+                return None
+            return conn.DeviceIdentity(
+                serial=found[0], model=found[1], name="rk3576_box",
+                android="14.0.1")
+
+        with mock.patch.object(
+                cdc_v2.legacy, "adb_command",
+                return_value=(0, self._DEVICES, 0.1)), \
+             mock.patch.object(
+                cdc_v2.CdcV2Window, "_read_device_identity",
+                autospec=True, side_effect=fake_identity):
+            window._refresh_devices_job(preferred=preferred)
+            self._drain_events()
+
+    def test_list_shows_serials_not_loopback_addresses(self):
+        window = self._window()
+        self._populate(window)
+        combo = window.device_combo
+        labels = [combo.itemText(i) for i in range(combo.count())]
+        self.assertEqual(labels, ["SN2026020201959", "SN2026020201148"])
+        for label in labels:
+            self.assertNotIn("127.0.0.1", label)
+
+    def test_the_app_still_acts_on_the_adb_address(self):
+        window = self._window()
+        self._populate(window, preferred="127.0.0.1:49217")
+        self.assertEqual(window.active_serial(), "127.0.0.1:49217")
+        self.assertEqual(window.device_var.get(), "127.0.0.1:49217")
+        self.assertEqual(window._current_device_serial(), "127.0.0.1:49217")
+
+    def test_a_transport_that_disappears_loses_its_cached_name(self):
+        window = self._window()
+        self._populate(window)
+        self.assertIn("127.0.0.1:49215", window._identity_by_address)
+        with mock.patch.object(
+                cdc_v2.legacy, "adb_command",
+                return_value=(0, "List of devices attached\n", 0.1)):
+            window._refresh_devices_job()
+            self._drain_events()
+        self.assertEqual(window._identity_by_address, {})
+        self.assertEqual(window.device_combo.count(), 0)
+
+    def test_an_unidentified_transport_still_lists_by_address(self):
+        window = self._window()
+        with mock.patch.object(
+                cdc_v2.legacy, "adb_command",
+                return_value=(0, self._DEVICES, 0.1)), \
+             mock.patch.object(
+                cdc_v2.CdcV2Window, "_read_device_identity",
+                autospec=True, return_value=None):
+            window._refresh_devices_job()
+            self._drain_events()
+        combo = window.device_combo
+        self.assertEqual(combo.itemText(0), "127.0.0.1:49215")
+        self.assertEqual(combo.itemData(0), "127.0.0.1:49215")
