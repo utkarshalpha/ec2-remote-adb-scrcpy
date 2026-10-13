@@ -24,7 +24,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 import cdc_v2 as base
 
 
-MAC_APP_VERSION = "2.4.0"
+MAC_APP_VERSION = "2.6.0"
 MAC_BUNDLE_ID = "ai.convrse.device-control"
 
 

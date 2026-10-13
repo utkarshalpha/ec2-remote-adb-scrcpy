@@ -16,10 +16,18 @@ protection, and production diagnostics.
 - Two compact sidebar categories: Remote and Device.
 - The menu bar stays out of the workspace until Alt is pressed. The command log
   is a thin collapsed strip until Ctrl+J is pressed.
+- **View › Show usage** (Ctrl+U) adds a Usage card to the left pane: live CPU,
+  GPU, memory, storage and network of the connected device, with two-minute
+  graphs in the style of Task Manager. Memory and storage show occupied and
+  available side by side. It polls once every 2 s with a single `adb shell`,
+  only while the card is on screen, and starts over when the leased port
+  begins answering for a different serial.
 
 ## Connection
 
-1. Select the local `.pem` key.
+1. Choose the `.pem` key on the installer's **SSH key** page (skipped when this
+   computer already has one). To change it later, press Alt, then
+   **File › Add or change SSH key**.
 2. Enter a shared port such as `17000` or `17003`.
 3. Click **Connect**.
 4. CDC automatically establishes and verifies the rooted Display Guard.
@@ -143,7 +151,7 @@ Build it once on an M-series Mac by double-clicking
 bash build-macos-arm64.sh
 ```
 
-The resulting installer is written to `versions/macos/v2.4.0`. The control app and
+The resulting installer is written to `versions/macos/v2.6.0`. The control app and
 scrcpy mirror use separate native Mac windows because the Windows HWND
 embedding mechanism has no safe Cocoa equivalent. See
 `docs/MACOS-APPLE-SILICON.md` for signing, notarization, and distribution details.

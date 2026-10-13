@@ -48,6 +48,8 @@ from PySide6.QtWidgets import (
 
 import cdc_connection as conn
 import cdc_qt as v1
+import cdc_usage as usage
+import cdc_usage_panel
 import scrcpy_remote as legacy
 from cdc_ai_guard import (
     AI_DISPLAY_TOGGLES,
@@ -62,7 +64,7 @@ from cdc_ai_guard import (
 
 
 APP_NAME = legacy.APP_NAME
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.6.0"
 
 
 def _offscreen_origin():
@@ -243,7 +245,28 @@ QPushButton#LogReveal {{
     background: transparent; color: {v1.SUBTLE}; text-align: right;
 }}
 QPushButton#LogReveal:hover {{ color: {v1.TEXT}; background: {v1.SURFACE_2}; }}
-"""
+QDialog, QMessageBox {{ background: {v1.SURFACE}; }}
+QDialog QLabel, QMessageBox QLabel {{ color: {v1.TEXT}; background: transparent; }}
+QRadioButton {{ color: {v1.TEXT}; spacing: 7px; background: transparent; }}
+QRadioButton:disabled {{ color: {v1.SUBTLE}; }}
+QRadioButton::indicator {{
+    width: 14px; height: 14px; border-radius: 8px;
+    border: 1px solid {v1.BORDER}; background: {v1.BG_ALT};
+}}
+QRadioButton::indicator:checked {{
+    border: 4px solid {v1.BLUE}; background: {v1.BG};
+}}
+QPlainTextEdit {{
+    background: {v1.BG_ALT}; border: 1px solid {v1.BORDER}; border-radius: 5px;
+    color: {v1.TEXT}; padding: 6px;
+    font-family: "Cascadia Mono", "Consolas", monospace; font-size: 11px;
+}}
+QPlainTextEdit:focus {{ border: 1px solid {v1.BLUE}; }}
+""" + cdc_usage_panel.USAGE_STYLESHEET
+
+# Every usage tick is one adb shell across the tunnel. Two seconds keeps the
+# graphs live without competing with the mirror for the link.
+USAGE_INTERVAL_MS = 2000
 
 
 def _role(widget, role):
@@ -623,6 +646,13 @@ class CdcV2Window(v1.CdcMainWindow):
         self._device_watch_ticks = 0
         # ADB address -> DeviceIdentity, so the list can show names.
         self._identity_by_address = {}
+        self._usage_sampler = usage.UsageSampler()
+        self._usage_serial = None
+        self._usage_in_flight = False
+        self._usage_failures = 0
+        self._usage_timer = QTimer(self)
+        self._usage_timer.setInterval(USAGE_INTERVAL_MS)
+        self._usage_timer.timeout.connect(self._usage_tick)
 
         self._build_menus()
 
@@ -653,6 +683,13 @@ class CdcV2Window(v1.CdcMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+
+        metric = self.settings.value("ui/usage_metric", "cpu", str)
+        if metric in cdc_usage_panel.METRIC_KEYS:
+            self.usage_panel.select(metric)
+        self._set_usage_visible(
+            self._bool_value(self.settings.value("ui/usage_visible", False), False),
+            persist=False)
 
     def _build_menus(self):
         menu_bar = self.menuBar()
@@ -700,6 +737,11 @@ class CdcV2Window(v1.CdcMainWindow):
         self.console_action = self._menu_action(
             view_menu, "Show command log", self._set_console_visible, "Ctrl+J", checkable=True)
         self.console_action.setChecked(False)
+        self.usage_action = self._menu_action(
+            view_menu, "Show usage", self._set_usage_visible, "Ctrl+U", checkable=True)
+        self.usage_action.setToolTip(
+            "CPU, GPU, memory, storage and network of the connected device")
+        self.usage_action.setChecked(False)
         view_menu.addSeparator()
         self.focus_action = self._menu_action(
             view_menu, "Focus mirror", self.set_focus_mode, "F11", checkable=True)
@@ -955,6 +997,16 @@ class CdcV2Window(v1.CdcMainWindow):
             button.setFixedHeight(CONTROL_HEIGHT)
             button.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        # Added after the sizing pass above: the usage card draws its own rows
+        # and must not be stretched into 36px sidebar buttons.
+        self.usage_panel = cdc_usage_panel.UsagePanel(USAGE_INTERVAL_MS // 1000)
+        self.usage_panel.hide()
+        self.usage_panel.close_requested.connect(
+            lambda: self._set_usage_visible(False))
+        self.usage_panel.metric_changed.connect(
+            lambda key: self.settings.setValue("ui/usage_metric", key))
+        content_layout.insertWidget(1, self.usage_panel)
 
         self.sidebar_scroll = scroll
         return shell
@@ -1499,6 +1551,79 @@ class CdcV2Window(v1.CdcMainWindow):
         if persist and not self._focus_mode:
             self.settings.setValue("ui/sidebar_visible", visible)
 
+    # ---------- device usage ----------
+    def _set_usage_visible(self, visible, persist=True):
+        """View > Show usage. Polling runs only while the card is on screen."""
+        visible = bool(visible)
+        self.usage_panel.setVisible(visible)
+        if self.usage_action.isChecked() != visible:
+            self.usage_action.blockSignals(True)
+            self.usage_action.setChecked(visible)
+            self.usage_action.blockSignals(False)
+        if visible:
+            if persist and not self.sidebar.isVisible() and not self._focus_mode:
+                self._set_sidebar_visible(True)
+            self.sidebar_scroll.ensureWidgetVisible(self.usage_panel, 0, 0)
+            if not self._usage_timer.isActive():
+                self._usage_timer.start()
+            QTimer.singleShot(0, self._usage_tick)
+        else:
+            self._usage_timer.stop()
+        if persist:
+            self.settings.setValue("ui/usage_visible", visible)
+
+    def _usage_tick(self):
+        if self._closing or not self.usage_panel.isVisible() or self.isMinimized():
+            return
+        serial = self.active_serial()
+        if serial != self._usage_serial:
+            # Another device, or none: its history would only mislead.
+            self._usage_serial = serial
+            self._usage_sampler.reset()
+            self._usage_failures = 0
+            self.usage_panel.clear()
+        if not serial:
+            self.usage_panel.set_status("No device", "idle")
+            return
+        if self._usage_in_flight:
+            # The tunnel is slower than the tick; skip rather than queue up.
+            return
+        if not self.usage_panel.has_samples():
+            self.usage_panel.set_status("Connecting…", "pending")
+        self._usage_in_flight = True
+
+        def job(target=serial):
+            rc, output, _elapsed = legacy.adb_command(
+                "shell", usage.USAGE_SCRIPT, serial=target, timeout=8,
+                telemetry=False)
+            self.ui(self._usage_on_reply, target, rc, output)
+
+        self.worker(job)
+
+    def _usage_on_reply(self, serial, rc, output):
+        self._usage_in_flight = False
+        if self._closing or serial != self._usage_serial:
+            return
+        try:
+            sample = self._usage_sampler.feed(output)
+        except usage.UsageParseError as exc:
+            self._usage_failures += 1
+            if self._usage_failures == 3:
+                self.logline(f"[Usage] {serial} is not answering: {exc}")
+            self.usage_panel.set_status(
+                "Not answering" if self._usage_failures >= 2 else "Retrying…",
+                "error" if self._usage_failures >= 2 else "pending")
+            return
+        self._usage_failures = 0
+        if sample.device_changed:
+            self.usage_panel.clear()
+            self.logline(
+                f"[Usage] {serial} now answers as {sample.serial}: the lease moved "
+                "to another device, so its usage starts over.")
+        self.usage_panel.add_sample(sample)
+        self.usage_panel.set_status(
+            f"Live · {USAGE_INTERVAL_MS // 1000} s", "online")
+
     def toggle_console(self):
         self._set_console_visible(self._console_collapsed)
 
@@ -1584,6 +1709,7 @@ class CdcV2Window(v1.CdcMainWindow):
             "Esc\tExit focus mode\n"
             "Ctrl+B\tShow or hide sidebar\n"
             "Ctrl+J\tShow or hide command log\n"
+            "Ctrl+U\tShow or hide device usage\n"
             "Ctrl+L\tFocus command log\n"
             "Ctrl+K\tClear command log\n"
             "F5\tRefresh devices\n"
@@ -1739,6 +1865,21 @@ class CdcV2Window(v1.CdcMainWindow):
     # ---------- SSH key: imported once, then never asked for again ----------
     def _migrate_legacy_key(self):
         """Adopt a key chosen by an earlier build so nobody re-imports by hand."""
+        # A key picked in the installer is the operator's latest choice, so it
+        # wins over anything already stored.
+        try:
+            path = conn.import_setup_key()
+        except conn.KeyImportError as exc:
+            self.logline(
+                f"[Key] The key chosen during setup could not be used: {exc} "
+                "Add it from File > Add or change SSH key (press Alt).")
+        else:
+            if path is not None:
+                self.settings.setValue("connection/pem", str(path))
+                self.logline(
+                    "[Key] Using the SSH key chosen during setup. Change it any "
+                    "time from File > Add or change SSH key (press Alt).")
+                return
         if conn.has_stored_key():
             return
         candidates = []
@@ -3765,6 +3906,7 @@ class CdcV2Window(v1.CdcMainWindow):
 
     def closeEvent(self, event):
         self._save_layout()
+        self._usage_timer.stop()
         super().closeEvent(event)
         if event.isAccepted():
             self._closing = True

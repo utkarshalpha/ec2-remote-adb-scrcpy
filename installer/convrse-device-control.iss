@@ -10,7 +10,7 @@
 ; ISCC comes from Inno Setup 6 (https://jrsoftware.org/isdl.php).
 
 #define AppName        "Convrse Device Control"
-#define AppVersion     "2.4.0"
+#define AppVersion     "2.6.0"
 #define AppPublisher   "Convrse Media Private Limited"
 #define AppExeName     "Convrse Device Control.exe"
 ; Overridable so the build can stage somewhere else when the usual output
@@ -79,6 +79,112 @@ Filename: "{app}\{#AppExeName}"; Description: "Start {#AppName}"; \
 Type: files; Name: "{app}\Convrse-Device-Control-startup.log"
 
 [Code]
+var
+  KeyPage: TInputFileWizardPage;
+
+function StoredKeyPath(): String;
+begin
+  Result := ExpandConstant('{localappdata}\Convrse\DeviceControl\keys\cdm-key.pem');
+end;
+
+function StagedKeyPath(): String;
+begin
+  Result := ExpandConstant('{localappdata}\Convrse\DeviceControl\keys\setup-import.pem');
+end;
+
+procedure InitializeWizard();
+var
+  Suggested: String;
+begin
+  // Asked once here so the first launch can connect straight away. The app
+  // imports the file itself, with the same checks as File > Add or change SSH
+  // key, which is also where it is changed later.
+  KeyPage := CreateInputFilePage(wpSelectTasks,
+    'SSH key',
+    'Choose the cdm.convrse.ai key this computer connects with.',
+    'Pick the .pem private key file. It is copied into this account''s private ' +
+    'app data, so the original can be moved or deleted afterwards.' + #13#10#13#10 +
+    'To change it later, open the app, press Alt, then File > Add or change SSH key.');
+  KeyPage.Add('Key file (.pem):', 'PEM private key (*.pem)|*.pem|All files (*.*)|*.*', '.pem');
+  Suggested := GetEnv('USERPROFILE') + '\Downloads\cdm-key.pem';
+  if FileExists(Suggested) then
+    KeyPage.Values[0] := Suggested;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  // An upgrade keeps the key already on this computer; nothing to ask.
+  Result := (KeyPage <> nil) and (PageID = KeyPage.ID) and FileExists(StoredKeyPath());
+end;
+
+function LooksLikePrivateKey(const Path: String; var Problem: String): Boolean;
+var
+  Body: AnsiString;
+begin
+  Result := False;
+  if not FileExists(Path) then
+  begin
+    Problem := 'That file does not exist.';
+    Exit;
+  end;
+  if not LoadStringFromFile(Path, Body) then
+  begin
+    Problem := 'That file could not be read.';
+    Exit;
+  end;
+  if Pos('ssh-rsa', Body) = 1 then
+  begin
+    Problem := 'That is the public half of the key (it starts with ssh-rsa). ' +
+               'Choose the private .pem file instead.';
+    Exit;
+  end;
+  if (Pos('-----BEGIN', Body) = 0) or (Pos('PRIVATE KEY-----', Body) = 0) then
+  begin
+    Problem := 'That does not look like a private key. It must contain a line ' +
+               'such as -----BEGIN RSA PRIVATE KEY-----.';
+    Exit;
+  end;
+  Result := True;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Path, Problem: String;
+begin
+  Result := True;
+  if (KeyPage = nil) or (CurPageID <> KeyPage.ID) then
+    Exit;
+  Path := Trim(KeyPage.Values[0]);
+  if Path = '' then
+  begin
+    Result := MsgBox('Continue without an SSH key?' + #13#10#13#10 +
+      'The app will ask for it before the first connection. You can also add ' +
+      'it from File > Add or change SSH key (press Alt).',
+      mbConfirmation, MB_YESNO) = IDYES;
+    Exit;
+  end;
+  if not LooksLikePrivateKey(Path, Problem) then
+  begin
+    MsgBox(Problem, mbError, MB_OK);
+    Result := False;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Path: String;
+begin
+  if (CurStep <> ssPostInstall) or (KeyPage = nil) then
+    Exit;
+  Path := Trim(KeyPage.Values[0]);
+  if (Path = '') or FileExists(StoredKeyPath()) then
+    Exit;
+  ForceDirectories(ExtractFileDir(StagedKeyPath()));
+  if not CopyFile(Path, StagedKeyPath(), False) then
+    MsgBox('The SSH key could not be copied. Add it from File > Add or change ' +
+           'SSH key after setup.', mbError, MB_OK);
+end;
+
 function InitializeSetup(): Boolean;
 var
   Version: TWindowsVersion;

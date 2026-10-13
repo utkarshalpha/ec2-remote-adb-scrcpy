@@ -1,6 +1,6 @@
 # Convrse Device Control — build and release
 
-Version 2.4.0. Windows x64.
+Version 2.6.0. Windows x64.
 
 ## Quick reference
 
@@ -17,8 +17,8 @@ Outputs land in `dist\`:
 | Artifact | Path |
 | --- | --- |
 | Application folder | `dist\ConvrseDeviceControl\` |
-| Portable archive | `dist\ConvrseDeviceControl-2.4.0-portable.zip` |
-| Installer | `dist\installer\ConvrseDeviceControl-2.4.0-Setup.exe` |
+| Portable archive | `dist\ConvrseDeviceControl-2.6.0-portable.zip` |
+| Installer | `dist\installer\ConvrseDeviceControl-2.6.0-Setup.exe` |
 
 ## Prerequisites
 

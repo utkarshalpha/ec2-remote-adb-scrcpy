@@ -4,7 +4,7 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_ROOT"
 
-APP_VERSION="2.4.0"
+APP_VERSION="2.6.0"
 RUNTIME_VERSION="4.1"
 RUNTIME_ARCHIVE="scrcpy-macos-aarch64-v${RUNTIME_VERSION}.tar.gz"
 RUNTIME_URL="https://github.com/Genymobile/scrcpy/releases/download/v${RUNTIME_VERSION}/${RUNTIME_ARCHIVE}"

@@ -155,6 +155,35 @@ def import_key_file(source: str | os.PathLike) -> Path:
     return import_key_text(text)
 
 
+# The installer's key page stages the operator's file here. The app imports it
+# on first launch, through the same checks as a key added by hand, so a key
+# picked during setup ends up normalised and locked down like any other.
+SETUP_KEY_FILENAME = "setup-import.pem"
+
+
+def staged_setup_key_path() -> Path:
+    return key_dir() / SETUP_KEY_FILENAME
+
+
+def import_setup_key() -> Path | None:
+    """Adopt the key chosen during setup, if any, then remove the staged copy.
+
+    Returns where the key was stored, or ``None`` when setup staged nothing.
+    Raises ``KeyImportError`` when the staged file is not a usable key; the
+    staged copy is removed either way so a bad file is reported only once.
+    """
+    staged = staged_setup_key_path()
+    if not staged.is_file():
+        return None
+    try:
+        return import_key_file(staged)
+    finally:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+
+
 def forget_key() -> None:
     path = stored_key_path()
     try:
