@@ -314,6 +314,74 @@ def build_ssh_command(
     ]
 
 
+# ------------------------------------------------------- gateway route ----
+#
+# The tablets on the fleet only trust the gateway's own ADB key.  A PC's adb
+# that reaches a leased port through a plain forward is refused at the
+# handshake ("failed to connect"), even though SSH, the key and the lease are
+# all fine.  The CDM website's working instructions therefore run every ADB
+# command through the gateway's ADB server on 5038: the PC forwards a local
+# socket to it and points its adb client there with ADB_SERVER_SOCKET.  The
+# leased port is then addressed from the gateway's side, as 127.0.0.1:<port>.
+#
+# scrcpy needs a second forward in that mode.  Its server is reached with
+# ``adb forward`` on the gateway's ADB server, so the socket it opens lives on
+# the gateway; ``--force-adb-forward --port N`` plus a same-numbered SSH
+# forward brings it back to this PC.
+
+GATEWAY_ADB_PORT = 5038
+SCRCPY_PORT_RANGE = (27183, 27299)
+
+
+def find_free_scrcpy_port(host: str = "127.0.0.1") -> int:
+    """A local port for the scrcpy forward, from scrcpy's own range.
+
+    The same number is used on the gateway, so staying inside scrcpy's usual
+    block keeps it recognisable in the gateway's socket list.
+    """
+    return find_free_local_port(host=host, port_range=SCRCPY_PORT_RANGE)
+
+
+def build_gateway_ssh_command(
+    ssh_executable: str,
+    pem_path: str,
+    local_adb_port: int,
+    scrcpy_port: int,
+    ssh_host: str,
+) -> list[str]:
+    """Forward the gateway's ADB server and a scrcpy socket to this PC."""
+    return [
+        ssh_executable,
+        "-i", pem_path,
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "BatchMode=yes",
+        "-N",
+        "-L", f"127.0.0.1:{local_adb_port}:127.0.0.1:{GATEWAY_ADB_PORT}",
+        "-L", f"127.0.0.1:{scrcpy_port}:127.0.0.1:{scrcpy_port}",
+        ssh_host,
+    ]
+
+
+def gateway_server_socket(local_adb_port: int) -> str:
+    """The ADB_SERVER_SOCKET value that sends adb to the gateway's server."""
+    return f"tcp:127.0.0.1:{local_adb_port}"
+
+
+def gateway_device_address(remote_port: int) -> str:
+    """How the gateway's ADB server names the leased device."""
+    return f"127.0.0.1:{remote_port}"
+
+
+def gateway_scrcpy_args(scrcpy_port: int | None) -> list[str]:
+    """Extra scrcpy arguments for a device reached through the gateway."""
+    if not scrcpy_port:
+        return []
+    return ["--force-adb-forward", f"--port={scrcpy_port}"]
+
+
 def describe_route(local_port: int | None, remote_port: int | None, host: str) -> str:
     """One-line rendering of the route, for the status strip and the log."""
     if not local_port or not remote_port:
@@ -325,14 +393,16 @@ def describe_route(local_port: int | None, remote_port: int | None, host: str) -
 class DeviceIdentity:
     """What actually answered on the other end of the tunnel."""
 
-    __slots__ = ("serial", "model", "name", "android", "project")
+    __slots__ = ("serial", "model", "name", "android", "project", "characteristics")
 
-    def __init__(self, serial="", model="", name="", android="", project=""):
+    def __init__(self, serial="", model="", name="", android="", project="",
+                 characteristics=""):
         self.serial = serial
         self.model = model
         self.name = name
         self.android = android
         self.project = project
+        self.characteristics = characteristics
 
     def __bool__(self):
         return bool(self.serial or self.model)

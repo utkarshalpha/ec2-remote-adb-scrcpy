@@ -1765,3 +1765,113 @@ class DeviceListNamingTests(unittest.TestCase):
         combo = window.device_combo
         self.assertEqual(combo.itemText(0), "127.0.0.1:49215")
         self.assertEqual(combo.itemData(0), "127.0.0.1:49215")
+
+
+class GatewayRouteWindowTests(DeviceListNamingTests):
+    """Tablets are reached through the gateway's shared ADB server."""
+
+    _GATEWAY_DEVICES = (
+        "List of devices attached\n"
+        "127.0.0.1:17000\tdevice\n"
+        "127.0.0.1:17003\tdevice\n"
+        "127.0.0.1:17004\toffline\n"
+    )
+
+    def test_only_this_sessions_device_is_listed(self):
+        # The other entries are colleagues' leases on the same shared server.
+        window = self._window()
+        window._gateway_target = "127.0.0.1:17000"
+        self.addCleanup(setattr, window, "_gateway_target", None)
+        with mock.patch.object(
+                cdc_v2.legacy, "adb_command",
+                return_value=(0, self._GATEWAY_DEVICES, 0.1)), \
+             mock.patch.object(
+                cdc_v2.CdcV2Window, "_read_device_identity",
+                autospec=True, return_value=None):
+            window._refresh_devices_job()
+            self._drain_events()
+        combo = window.device_combo
+        self.assertEqual(
+            [combo.itemData(i) for i in range(combo.count())],
+            ["127.0.0.1:17000"])
+
+    def test_leaving_the_gateway_points_adb_back_at_the_local_server(self):
+        window = self._window()
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        window._gateway_proc = proc
+        window._gateway_target = "127.0.0.1:17000"
+        window._scrcpy_port = 27190
+        with mock.patch.dict(
+                cdc_v2.os.environ, {"ADB_SERVER_SOCKET": "tcp:127.0.0.1:49300"}):
+            window._leave_gateway_mode(proc)
+            self.assertNotIn("ADB_SERVER_SOCKET", cdc_v2.os.environ)
+        proc.terminate.assert_called_once()
+        self.assertIsNone(window._gateway_target)
+        self.assertIsNone(window._scrcpy_port)
+
+    def test_a_stale_forward_cannot_tear_down_the_current_one(self):
+        window = self._window()
+        current, stale = mock.Mock(), mock.Mock()
+        window._gateway_proc = current
+        window._gateway_target = "127.0.0.1:17000"
+        self.addCleanup(setattr, window, "_gateway_target", None)
+        self.addCleanup(setattr, window, "_gateway_proc", None)
+        window._leave_gateway_mode(stale)
+        self.assertIs(window._gateway_proc, current)
+        self.assertEqual(window._gateway_target, "127.0.0.1:17000")
+
+    def test_mirror_uses_forward_mode_through_the_gateway(self):
+        window = self._window()
+        window.worker = lambda _callback: None
+        window.after = lambda *_args, **_kwargs: None
+        window._gateway_target = "127.0.0.1:17000"
+        window._scrcpy_port = 27190
+        self.addCleanup(setattr, window, "_gateway_target", None)
+        with mock.patch.object(window, "require_serial",
+                               return_value="127.0.0.1:17000"), \
+                mock.patch.object(cdc_v2.subprocess, "Popen") as popen:
+            window._guard_status_by_serial["127.0.0.1:17000"] = "protected"
+            popen.return_value = mock.Mock(poll=mock.Mock(return_value=None))
+            window.start_scrcpy()
+            command = popen.call_args.args[0]
+        window.scrcpy_proc = None
+        self.assertIn("--force-adb-forward", command)
+        self.assertIn("--port=27190", command)
+
+    def test_device_menu_offers_find_and_power(self):
+        window = self._window()
+        texts = [a.text() for a in window._menus["&Device"].actions() if a.text()]
+        self.assertEqual(
+            texts, ["Battery and screen", "Ring device", "Show find-me message"])
+
+    def test_tablet_card_shows_only_for_tablets(self):
+        import cdc_connection as conn
+        window = self._window()
+        window.worker = lambda _callback: None
+        window._identity_by_address["127.0.0.1:17000"] = conn.DeviceIdentity(
+            serial="R9ZY70QLQ7N", model="SM-X216B", characteristics="tablet")
+        window._identity_by_address["127.0.0.1:49215"] = conn.DeviceIdentity(
+            serial="SN2026020201959", model="H96_Max_M9", characteristics="default")
+        window._sync_tablet_card("127.0.0.1:17000")
+        self.assertFalse(window.tablet_card.isHidden())
+        self.assertTrue(window.media_keys_row.isHidden())
+        self.assertTrue(window.ai_pq_card.isHidden())
+        window._sync_tablet_card("127.0.0.1:49215")
+        self.assertTrue(window.tablet_card.isHidden())
+        self.assertFalse(window.media_keys_row.isHidden())
+        self.assertFalse(window.ai_pq_card.isHidden())
+        window._sync_tablet_card("")
+        self.assertTrue(window.tablet_card.isHidden())
+
+    def test_tablet_status_drives_the_card(self):
+        import cdc_tablet
+        window = self._window()
+        status = cdc_tablet.parse_status(
+            "@@battery\n level: 30\n scale: 100\n AC powered: false\n"
+            "@@power\n mWakefulness=Dozing\n mLastSleepReason=cover_close\n"
+            "@@rotation\nauto=1\nuser=0\n")
+        window._show_tablet_status(status)
+        self.assertIn("cover is closed", window.tablet_status_label.text())
+        self.assertTrue(window.auto_rotate_button.isChecked())
+        self.assertEqual(window._tablet_rotation, 0)

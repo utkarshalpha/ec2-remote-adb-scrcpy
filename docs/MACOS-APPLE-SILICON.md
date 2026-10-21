@@ -5,7 +5,7 @@ Python, Homebrew, ADB, scrcpy, or Terminal.
 
 ## End-user installation
 
-1. Open `Convrse-Device-Control-2.6.0-Apple-Silicon.dmg`.
+1. Open `Convrse-Device-Control-2.7.0-Apple-Silicon.dmg`.
 2. Drag **Convrse Device Control** to **Applications**.
 3. Double-click **Convrse Device Control**.
 
@@ -25,7 +25,7 @@ bash build-macos-arm64.sh
 
 The builder verifies the official scrcpy 4.1 archive SHA-256, creates the Mac
 icon from the supplied Convrse logo, runs the complete tests, builds the `.app`,
-and creates the drag-to-Applications DMG under `versions/macos/v2.6.0`.
+and creates the drag-to-Applications DMG under `versions/macos/v2.7.0`.
 
 ## Native mirror behavior
 

@@ -17,4 +17,4 @@ Preview and legacy pre-version builds are stored under
 `versions/windows/previews` and `versions/windows/legacy`.
 
 New Windows builds are written to `versions/windows/v2.3`. The Apple Silicon
-builder writes its `.app` and `.dmg` to `versions/macos/v2.6.0`.
+builder writes its `.app` and `.dmg` to `versions/macos/v2.7.0`.

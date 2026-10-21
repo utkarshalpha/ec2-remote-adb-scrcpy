@@ -13,7 +13,8 @@ protection, and production diagnostics.
   double-click enter focus mode, while Escape exits it.
 - Fixed, consistent control sizing: 40 px connection actions, 36 px sidebar
   actions, and 38 px app-bar controls.
-- Two compact sidebar categories: Remote and Device.
+- Two compact sidebar categories: Remote and Device. A Tablet card joins
+  Remote when a tablet is connected (see Tablets).
 - The menu bar stays out of the workspace until Alt is pressed. The command log
   is a thin collapsed strip until Ctrl+J is pressed.
 - **View › Show usage** (Ctrl+U) adds a Usage card to the left pane: live CPU,
@@ -33,8 +34,30 @@ protection, and production diagnostics.
 4. CDC automatically establishes and verifies the rooted Display Guard.
 5. Click **Start mirror** after protection and stream detection complete.
 
-CDC creates `-L PORT:localhost:PORT` to `ubuntu@cdm.convrse.ai`, then connects
-ADB to `127.0.0.1:PORT`. Windows OpenSSH Client is required.
+CDC first forwards the gateway's own ADB server (port 5038) plus one scrcpy
+port, points ADB at it with `ADB_SERVER_SOCKET`, and connects to
+`127.0.0.1:PORT` as the gateway sees it. That is the only route the tablets
+accept: they trust the gateway's ADB key, not each PC's. scrcpy runs with
+`--force-adb-forward --port N` over the second forward. Because the gateway's
+ADB server is shared by every operator, the device list shows only this
+session's device. If the gateway route does not answer, CDC falls back to the
+2.6 route: a private local socket forwarded to the leased port, with ADB on
+this PC. Windows OpenSSH Client is required.
+
+## Tablets
+
+When the connected device reports `ro.build.characteristics=tablet` (or has a
+Samsung `SM-T/X/P` or Lenovo `TB` model name), the Remote tab shows a
+**Tablet** card and hides what only the media players use: the media keys and
+the Display processing card. Display protection is skipped on tablets.
+
+- Battery level, charger and screen state, including **cover closed** on
+  Samsung, which refuses a remote wake while its book cover is shut.
+- Auto-rotate on/off, Rotate (a quarter turn, then held), Wake, Lock.
+- **Ring** plays a ringtone at full volume until stopped, then restores the
+  volume. **Find-me** opens the notification panel with a CDM message and the
+  serial. Both are also under **Device** in the menu bar (Ctrl+R, Ctrl+M), with
+  **Battery and screen** (Ctrl+P).
 
 ## Production features
 
@@ -151,7 +174,7 @@ Build it once on an M-series Mac by double-clicking
 bash build-macos-arm64.sh
 ```
 
-The resulting installer is written to `versions/macos/v2.6.0`. The control app and
+The resulting installer is written to `versions/macos/v2.7.0`. The control app and
 scrcpy mirror use separate native Mac windows because the Windows HWND
 embedding mechanism has no safe Cocoa equivalent. See
 `docs/MACOS-APPLE-SILICON.md` for signing, notarization, and distribution details.

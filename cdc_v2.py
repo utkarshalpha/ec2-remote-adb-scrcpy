@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
 
 import cdc_connection as conn
 import cdc_qt as v1
+import cdc_tablet as tablet
 import cdc_usage as usage
 import cdc_usage_panel
 import scrcpy_remote as legacy
@@ -64,7 +65,7 @@ from cdc_ai_guard import (
 
 
 APP_NAME = legacy.APP_NAME
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 
 
 def _offscreen_origin():
@@ -644,6 +645,17 @@ class CdcV2Window(v1.CdcMainWindow):
         self._device_watch_timer = None
         self._device_watch_target = ""
         self._device_watch_ticks = 0
+        # Gateway route: adb runs on the gateway's own server (see
+        # cdc_connection).  _gateway_target is the leased device as that server
+        # names it; None means the direct route, or no tunnel at all.
+        self._gateway_proc = None
+        self._gateway_target = None
+        self._scrcpy_port = None
+        # Find device: the ring loop and the on-screen message.
+        self._ring_timer = None
+        self._ring_plan = None
+        self._find_message_serial = None
+        self._tablet_rotation = None
         # ADB address -> DeviceIdentity, so the list can show names.
         self._identity_by_address = {}
         self._usage_sampler = usage.UsageSampler()
@@ -748,6 +760,22 @@ class CdcV2Window(v1.CdcMainWindow):
         self.focus_action.setChecked(False)
         self._menu_action(view_menu, "Reset layout", self.reset_layout, "Ctrl+0")
         self._menu_action(view_menu, "Refresh device", self.refresh_devices, "F5")
+
+        device_menu = self._add_menu("&Device")
+        self._menu_action(
+            device_menu, "Battery and screen", self.check_power_status, "Ctrl+P")
+        device_menu.addSeparator()
+        self.ring_action = self._menu_action(
+            device_menu, "Ring device", self._set_ringing, "Ctrl+R", checkable=True)
+        self.ring_action.setToolTip(
+            "Play a ringtone at full volume until stopped, so someone on site "
+            "can find the device")
+        self.find_message_action = self._menu_action(
+            device_menu, "Show find-me message", self._set_find_message,
+            "Ctrl+M", checkable=True)
+        self.find_message_action.setToolTip(
+            "Open the notification panel on the device with a CDM message and "
+            "its serial")
 
         help_menu = self._add_menu("&Help")
         self._menu_action(help_menu, "Keyboard shortcuts", self._show_shortcuts, "Ctrl+/")
@@ -977,7 +1005,7 @@ class CdcV2Window(v1.CdcMainWindow):
 
         self.category_stack = QStackedWidget()
         self.category_stack.addWidget(self._category_page(
-            self._remote_card(), self._recovery_card()))
+            self._tablet_card(), self._remote_card(), self._recovery_card()))
         self.category_stack.addWidget(self._category_page(
             self._ai_pq_card_v2(), self._tools_card()))
         content_layout.addWidget(self.category_stack)
@@ -1206,6 +1234,51 @@ class CdcV2Window(v1.CdcMainWindow):
         button.clicked.connect(lambda _checked=False, slot=callback: slot())
         return button
 
+    def _tablet_card(self):
+        """Controls that only make sense on a tablet.
+
+        Hidden until the connected device reports itself as a tablet, so the
+        media players keep exactly the sidebar they had.
+        """
+        card, layout = self._card("Tablet")
+        self.tablet_card = card
+        self.tablet_status_label = v1._label("Reading battery and screen…", "Package")
+        self.tablet_status_label.setWordWrap(True)
+        layout.addWidget(self.tablet_status_label)
+
+        self.auto_rotate_button = self._action_button(
+            "⟳  Auto-rotate", lambda: self._set_auto_rotate(
+                self.auto_rotate_button.isChecked()))
+        self.auto_rotate_button.setCheckable(True)
+        self.auto_rotate_button.setToolTip(
+            "Let the tablet turn its screen with the device, or hold it still")
+        rotate = self._action_button("↻  Rotate", self._rotate_once)
+        rotate.setToolTip("Turn the screen a quarter turn and lock it there")
+        layout.addWidget(self._grid_of([self.auto_rotate_button, rotate], columns=2))
+
+        layout.addWidget(self._grid_of([
+            self._action_button("☀  Wake", lambda: self._tablet_shell(
+                tablet.WAKE_COMMAND, "Woke the screen", check_cover=True)),
+            self._action_button("☾  Lock", lambda: self._tablet_shell(
+                tablet.LOCK_COMMAND, "Locked the screen")),
+            self._action_button("▮  Battery", self.check_power_status),
+        ]))
+
+        self.ring_button = self._action_button(
+            "♪  Ring", lambda: self.ring_action.trigger())
+        self.ring_button.setCheckable(True)
+        self.ring_button.setToolTip(self.ring_action.toolTip())
+        self.ring_action.toggled.connect(self.ring_button.setChecked)
+        self.find_button = self._action_button(
+            "⚑  Find-me", lambda: self.find_message_action.trigger())
+        self.find_button.setCheckable(True)
+        self.find_button.setToolTip(self.find_message_action.toolTip())
+        self.find_message_action.toggled.connect(self.find_button.setChecked)
+        layout.addWidget(self._grid_of([self.ring_button, self.find_button], columns=2))
+
+        card.hide()
+        return card
+
     def _remote_card(self):
         card, layout = self._card("Remote control")
         key = self.send_keyevent
@@ -1218,11 +1291,14 @@ class CdcV2Window(v1.CdcMainWindow):
         # U+25C4/U+25BA rather than the U+23EE media glyphs: the media set has an
         # emoji presentation by default, so it rendered in colour next to the
         # monochrome symbols and looked like a mistake.
-        layout.addWidget(self._grid_of([
+        # Media keys drive the players' video app; a tablet has nothing they
+        # control, so the row hides while one is connected.
+        self.media_keys_row = self._grid_of([
             self._action_button("◄◄", lambda: key("88")),
             self._action_button("►  Play", lambda: key("85")),
             self._action_button("►►", lambda: key("87")),
-        ]))
+        ])
+        layout.addWidget(self.media_keys_row)
 
         more = QWidget()
         more_layout = QVBoxLayout(more)
@@ -1301,6 +1377,7 @@ class CdcV2Window(v1.CdcMainWindow):
 
     def _ai_pq_card_v2(self):
         card, layout = self._card("Display processing")
+        self.ai_pq_card = card
         self.ai_pq_status_label = v1._label("Waiting for a device", "AiStatus")
         self.ai_pq_status_label.setProperty("tone", "idle")
         self.ai_pq_status_label.setWordWrap(True)
@@ -1713,6 +1790,9 @@ class CdcV2Window(v1.CdcMainWindow):
             "Ctrl+L\tFocus command log\n"
             "Ctrl+K\tClear command log\n"
             "F5\tRefresh devices\n"
+            "Ctrl+P\tBattery and screen\n"
+            "Ctrl+R\tRing device\n"
+            "Ctrl+M\tShow find-me message\n"
             "Ctrl+0\tReset layout\n"
             "Ctrl+O\tAdd or change SSH key\n"
             "Ctrl+I\tInstall APK\n"
@@ -1978,65 +2058,144 @@ class CdcV2Window(v1.CdcMainWindow):
                 "OpenSSH Client, then try again.")
             return
 
-        local_port = conn.find_free_local_port()
-        self._pending_local_port = local_port
-        self._pending_remote_port = remote_port
-        target = f"{legacy.DEFAULT_IP}:{local_port}"
-
-        self.ip_edit.setText(f"{legacy.DEFAULT_IP}:{local_port}")
-        self._set_route_state(
-            conn.describe_route(local_port, remote_port, legacy.SSH_HOST), "pending")
+        self._set_route_state(f"Opening tunnel to leased port {remote_port} …", "pending")
         self.status_var.set(f"Opening tunnel to leased port {remote_port} …")
         self._set_tunnel_state("Connecting…", "pending")
 
         def job():
-            command = conn.build_ssh_command(
-                ssh_executable, pem_path, local_port, remote_port, legacy.SSH_HOST)
-            self.logline("[SSH] " + legacy.command_text(command))
-            try:
-                proc = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    errors="replace",
-                    creationflags=legacy._NO_WINDOW,
-                )
-            except OSError as exc:
-                self._fail_tunnel(f"Could not start SSH: {exc}")
+            # Gateway route first: it is the only one the tablets accept.  The
+            # direct route stays as the fallback, since it is what the media
+            # players were connected with until now.
+            if self._connect_via_gateway(ssh_executable, pem_path, remote_port):
                 return
-
-            self.ssh_proc = proc
-            self.ssh_port = local_port
-            self.ssh_remote_port = remote_port
-            self.ssh_pem = pem_path
-            threading.Thread(
-                target=self._watch_ssh_output, args=(proc,), daemon=True).start()
-
-            for _ in range(40):
-                if proc.poll() is not None:
-                    break
-                if conn.is_port_in_use(local_port):
-                    break
-                time.sleep(0.25)
-            else:
-                self._fail_tunnel(
-                    f"The forward to leased port {remote_port} never came up.")
-                return
-            if proc.poll() is not None:
-                self._fail_tunnel(
-                    "SSH exited before the tunnel opened. If it reports "
-                    "'Permission denied (publickey)', the key needs replacing.")
-                return
-
-            self.ui(
-                self._set_route_state,
-                conn.describe_route(local_port, remote_port, legacy.SSH_HOST),
-                "online")
-            self._connect_adb_target(target)
+            self.logline(
+                "[SSH] Gateway ADB route did not reach the device; trying the "
+                "direct route.")
+            self._connect_direct(ssh_executable, pem_path, remote_port)
 
         self.worker(job)
+
+    def _open_forward(self, command, local_port):
+        """Start ssh and wait for its local socket.  Returns (proc, error)."""
+        self.logline("[SSH] " + legacy.command_text(command))
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                creationflags=legacy._NO_WINDOW,
+            )
+        except OSError as exc:
+            return None, f"Could not start SSH: {exc}"
+        threading.Thread(
+            target=self._watch_ssh_output, args=(proc,), daemon=True).start()
+        for _ in range(40):
+            if proc.poll() is not None:
+                break
+            if conn.is_port_in_use(local_port):
+                break
+            time.sleep(0.25)
+        else:
+            self._terminate_quietly(proc)
+            return None, "The forward never came up."
+        if proc.poll() is not None:
+            return None, (
+                "SSH exited before the tunnel opened. If it reports "
+                "'Permission denied (publickey)', the key needs replacing.")
+        return proc, ""
+
+    @staticmethod
+    def _terminate_quietly(proc):
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+    def _connect_via_gateway(self, ssh_executable, pem_path, remote_port):
+        """Run adb on the gateway's server.  True once the device answered."""
+        adb_port = conn.find_free_local_port()
+        scrcpy_port = conn.find_free_scrcpy_port()
+        command = conn.build_gateway_ssh_command(
+            ssh_executable, pem_path, adb_port, scrcpy_port, legacy.SSH_HOST)
+        proc, error = self._open_forward(command, adb_port)
+        if proc is None:
+            self.logline("[SSH] Gateway route: " + error)
+            return False
+
+        target = conn.gateway_device_address(remote_port)
+        self._gateway_proc = proc
+        os.environ["ADB_SERVER_SOCKET"] = conn.gateway_server_socket(adb_port)
+        if not self._adb_connect(target):
+            self._leave_gateway_mode(proc)
+            return False
+
+        self.ssh_proc = proc
+        self.ssh_port = adb_port
+        self.ssh_remote_port = remote_port
+        self.ssh_pem = pem_path
+        self._gateway_target = target
+        self._scrcpy_port = scrcpy_port
+        self.ui(self.ip_edit.setText, target)
+        self.ui(
+            self._set_route_state,
+            f"Gateway ADB  →  {legacy.SSH_HOST.split('@')[-1]}:{remote_port}",
+            "online")
+        self._finish_connect(target)
+        return True
+
+    def _leave_gateway_mode(self, proc=None):
+        """Point adb back at the local server and drop the gateway forward.
+
+        This must happen as soon as the forward dies.  With ADB_SERVER_SOCKET
+        still naming a dead local port, the next adb call would start a fresh
+        local server on that port and quietly take it over.
+        """
+        if proc is not None and self._gateway_proc is not proc:
+            return
+        gateway = self._gateway_proc
+        self._gateway_proc = None
+        self._gateway_target = None
+        self._scrcpy_port = None
+        os.environ.pop("ADB_SERVER_SOCKET", None)
+        self._terminate_quietly(gateway)
+
+    def _watch_ssh_output(self, proc):
+        super()._watch_ssh_output(proc)
+        if proc.poll() is not None and self._gateway_proc is proc:
+            self._leave_gateway_mode(proc)
+
+    def _connect_direct(self, ssh_executable, pem_path, remote_port):
+        """Forward the leased port to a private local socket (2.6 behaviour)."""
+        local_port = conn.find_free_local_port()
+        self._pending_local_port = local_port
+        self._pending_remote_port = remote_port
+        target = f"{legacy.DEFAULT_IP}:{local_port}"
+        self.ui(self.ip_edit.setText, target)
+        self.ui(
+            self._set_route_state,
+            conn.describe_route(local_port, remote_port, legacy.SSH_HOST), "pending")
+
+        command = conn.build_ssh_command(
+            ssh_executable, pem_path, local_port, remote_port, legacy.SSH_HOST)
+        proc, error = self._open_forward(command, local_port)
+        if proc is None:
+            self.ssh_proc = None
+            self._fail_tunnel(f"Leased port {remote_port}: {error}")
+            return
+
+        self.ssh_proc = proc
+        self.ssh_port = local_port
+        self.ssh_remote_port = remote_port
+        self.ssh_pem = pem_path
+        self.ui(
+            self._set_route_state,
+            conn.describe_route(local_port, remote_port, legacy.SSH_HOST),
+            "online")
+        self._connect_adb_target(target)
 
     def _fail_tunnel(self, message):
         self.logline("[SSH] " + message)
@@ -2051,17 +2210,21 @@ class CdcV2Window(v1.CdcMainWindow):
                 pass
         self.ssh_proc = None
 
-    def _connect_adb_target(self, target):
-        """Attach ADB, then prove which device actually answered."""
+    def _adb_connect(self, target):
         result = legacy.adb_command("connect", target, timeout=40)
         self.logline(f"[ADB] connect {target}: {result[1] or 'no response'}")
         output = (result[1] or "").lower()
-        if result[0] != 0 or not ("connected" in output or "already" in output):
+        return (result[0] == 0
+                and ("connected" in output or "already" in output)
+                and "failed" not in output)
+
+    def _connect_adb_target(self, target):
+        """Attach ADB over the direct route, then prove which device answered."""
+        if not self._adb_connect(target):
             # The forward opened, so SSH and the key are fine and the gateway
             # accepted the connection.  The device behind it did not answer.
-            # In the field this is nearly always an expired lease: the tunnel
-            # auto-expires, the local socket keeps accepting, and only the ADB
-            # handshake reveals that nothing is on the other end.
+            # Either the lease expired, or the device only trusts the
+            # gateway's ADB key and the gateway route was not available.
             self._fail_tunnel(
                 f"The tunnel to port {self.ssh_remote_port} opened, but the "
                 "device did not answer.\n\n"
@@ -2069,7 +2232,9 @@ class CdcV2Window(v1.CdcMainWindow):
                 "for this device on the CDM website and use the new port it "
                 "shows — it will not be the same number.")
             return
+        self._finish_connect(target)
 
+    def _finish_connect(self, target):
         identity = self._read_device_identity(target)
         if not identity:
             self.logline(
@@ -2087,6 +2252,7 @@ class CdcV2Window(v1.CdcMainWindow):
             self._set_tunnel_state,
             f"Live on {self.ssh_remote_port}", "online")
         self.ui(self.status_var.set, "Connected")
+        self._report_power_status(target)
         self._refresh_devices_job(preferred=target)
         # ADB can take a few seconds to promote a fresh transport from offline
         # to device. Poll for it instead of leaving the operator to press
@@ -2109,6 +2275,12 @@ class CdcV2Window(v1.CdcMainWindow):
                 fields = line.strip().split()
                 if len(fields) >= 2 and fields[1] == "device":
                     addresses.append(fields[0])
+        if self._gateway_target:
+            # The gateway's ADB server is shared by every operator, so its list
+            # holds their devices too.  Showing them would put someone else's
+            # screen one click away, which is the incident the leased-port
+            # design exists to prevent.
+            addresses = [a for a in addresses if a == self._gateway_target]
 
         for address in addresses:
             if address not in self._identity_by_address:
@@ -2228,7 +2400,7 @@ class CdcV2Window(v1.CdcMainWindow):
         """Ask the device who it is. This is what makes a stale port harmless."""
         props = {}
         for key in ("ro.serialno", "ro.product.model", "ro.product.device",
-                    "ro.build.version.release"):
+                    "ro.build.version.release", "ro.build.characteristics"):
             rc, out, _elapsed = legacy.adb_command(
                 "shell", "getprop", key, serial=serial, timeout=15,
                 telemetry=False)
@@ -2250,28 +2422,321 @@ class CdcV2Window(v1.CdcMainWindow):
             name=props.get("ro.product.device", ""),
             android=props.get("ro.build.version.release", ""),
             project=project,
+            characteristics=props.get("ro.build.characteristics", ""),
         )
 
+    # ---------- tablets: power state and finding the device ----------
+    def _device_shell(self, serial, script, timeout=20):
+        rc, out, _elapsed = legacy.adb_command(
+            "shell", script, serial=serial, timeout=timeout, telemetry=False)
+        return rc, out or ""
+
+    def _report_power_status(self, serial):
+        """Log battery and screen, and say plainly when a wake cannot work."""
+        rc, out = self._device_shell(serial, tablet.STATUS_COMMAND)
+        if rc != 0:
+            return None
+        status = tablet.parse_status(out)
+        if serial == self.active_serial():
+            self.ui(self._show_tablet_status, status)
+        summary = status.summary()
+        if summary:
+            self.logline(f"[Device] {summary}")
+        if status.cover_closed:
+            self.ui(self.status_var.set, "Screen off · the tablet's cover is closed")
+        elif status.low_battery:
+            self.ui(self.status_var.set,
+                    f"Battery low · {status.battery_text()}")
+        return status
+
+    def _identity_for(self, serial):
+        return (self._identity_by_address.get(serial)
+                or (self._connected_identity if serial else None))
+
+    def _is_tablet(self, serial):
+        identity = self._identity_for(serial)
+        return bool(identity) and tablet.is_tablet(
+            identity.characteristics, identity.model)
+
+    def _sync_tablet_card(self, serial):
+        """Show the tablet's controls, or the media player's, never both."""
+        show = bool(serial) and self._is_tablet(serial)
+        self.tablet_card.setVisible(show)
+        for widget in (getattr(self, "media_keys_row", None),
+                       getattr(self, "ai_pq_card", None)):
+            if widget is not None:
+                widget.setVisible(not show)
+        if show:
+            self.tablet_status_label.setText("Reading battery and screen…")
+            self.worker(lambda: self._report_power_status(serial))
+
+    def _show_tablet_status(self, status):
+        lines = []
+        if status.battery_text():
+            lines.append(f"Battery {status.battery_text()}")
+        if status.screen_text():
+            lines.append(f"Screen {status.screen_text().lower()}")
+        if status.auto_rotate is not None:
+            lines.append("Auto-rotate " + ("on" if status.auto_rotate else "off"))
+        text = "  ·  ".join(lines) or "Battery and screen not reported"
+        reason = status.wake_blocked_reason()
+        if reason:
+            text += "\n" + reason
+        elif status.low_battery:
+            text += "\nBattery low. Ask someone on site to plug it in."
+        self.tablet_status_label.setText(text)
+        self.tablet_status_label.setProperty(
+            "tone", "error" if (reason or status.low_battery) else "idle")
+        _repolish(self.tablet_status_label)
+        if status.auto_rotate is not None:
+            self.auto_rotate_button.setChecked(status.auto_rotate)
+        self._tablet_rotation = status.user_rotation
+
+    def _tablet_shell(self, script, done_text, check_cover=False):
+        serial = self.require_serial()
+        if not serial:
+            return
+
+        def job():
+            rc, out = self._device_shell(serial, script)
+            if rc != 0:
+                self.logline(f"[Tablet] {done_text} failed: {out.strip()}")
+                self.ui(self.status_var.set, f"{done_text} failed — see command log")
+                return
+            self.logline(f"[Tablet] {done_text}")
+            self.ui(self.status_var.set, done_text)
+            time.sleep(1.5 if check_cover else 0.5)
+            status = self._report_power_status(serial)
+            if check_cover and status is not None and status.cover_closed:
+                self.logline("[Device] " + status.wake_blocked_reason())
+
+        self.worker(job)
+
+    def _set_auto_rotate(self, enabled):
+        self._tablet_shell(
+            tablet.auto_rotate_command(enabled),
+            "Auto-rotate on" if enabled else "Auto-rotate off")
+
+    def _rotate_once(self):
+        self.auto_rotate_button.setChecked(False)
+        self._tablet_shell(
+            tablet.rotate_command(self._tablet_rotation),
+            "Rotated the screen")
+
+    def check_power_status(self):
+        """Device › Battery and screen."""
+        serial = self.require_serial()
+        if not serial:
+            return
+
+        def job():
+            status = self._report_power_status(serial)
+
+            def show():
+                if status is None or not status.summary():
+                    QMessageBox.warning(
+                        self, APP_NAME,
+                        "The device did not report its battery or screen state.")
+                    return
+                lines = []
+                if status.battery_text():
+                    lines.append(f"Battery: {status.battery_text()}")
+                if status.screen_text():
+                    lines.append(f"Screen: {status.screen_text()}")
+                reason = status.wake_blocked_reason()
+                if reason:
+                    lines += ["", reason]
+                elif status.low_battery:
+                    lines += ["", "Ask someone on site to plug it in."]
+                QMessageBox.information(
+                    self, "Battery and screen", "\n".join(lines))
+
+            self.ui(show)
+
+        self.worker(job)
+
+    def send_keyevent(self, code):
+        super().send_keyevent(code)
+        if str(code) in ("26", "224"):
+            # Power and Wake are the keys a closed cover silently swallows.
+            serial = self.active_serial()
+            if serial:
+                def job():
+                    time.sleep(1.5)
+                    status = self._report_power_status(serial)
+                    if status is not None and status.cover_closed:
+                        self.logline("[Device] " + status.wake_blocked_reason())
+                self.worker(job)
+
+    def _set_ringing(self, enabled):
+        if not enabled:
+            self._stop_ringing()
+            return
+        serial = self.require_serial()
+        if not serial:
+            self.ring_action.setChecked(False)
+            return
+        self.status_var.set("Preparing to ring the device…")
+
+        def job():
+            rc, out = self._device_shell(serial, tablet.ringtone_lookup_command())
+            path = out.strip().splitlines()[0].strip() if rc == 0 and out.strip() else ""
+            if not path:
+                self.logline("[Find] No ringtone file was found on the device.")
+                self.ui(self.ring_action.setChecked, False)
+                self.ui(self.status_var.set, "Could not ring: no ringtone on the device")
+                return
+            _rc, players = self._device_shell(serial, tablet.player_lookup_command(path))
+            component = tablet.parse_player_component(players)
+            _rc, volume_text = self._device_shell(serial, tablet.volume_get_command())
+            plan = {
+                "serial": serial,
+                "path": path,
+                "component": component,
+                "restore": tablet.parse_volume(volume_text),
+                "max": tablet.parse_max_volume(volume_text),
+            }
+            self.logline(
+                f"[Find] Ringing {serial} with {path.rsplit('/', 1)[-1]}"
+                + (f" via {component}" if component else "")
+                + (f", volume {plan['restore']} → {plan['max']}"
+                   if plan["max"] is not None else ""))
+            self.ui(self._start_ring_timer, plan)
+
+        self.worker(job)
+
+    def _start_ring_timer(self, plan):
+        if not self.ring_action.isChecked():
+            return
+        self._ring_plan = plan
+        self._ring_tick()
+        timer = QTimer(self)
+        # Ringtones run a few seconds; restarting every 6s keeps it continuous
+        # without stacking players.
+        timer.setInterval(6000)
+        timer.timeout.connect(self._ring_tick)
+        timer.start()
+        self._ring_timer = timer
+        self.status_var.set("Ringing the device · Device › Ring device to stop")
+
+    def _ring_tick(self):
+        plan = self._ring_plan
+        if not plan or self._closing:
+            return
+        if plan["serial"] != self.active_serial():
+            # The device went away or the operator switched; never ring
+            # whatever happens to be selected now.
+            self._stop_ringing()
+            return
+        script = tablet.ring_once_command(plan["component"], plan["path"], plan["max"])
+        self.worker(lambda: self._device_shell(plan["serial"], script))
+
+    def _stop_ringing(self, wait=False):
+        timer = self._ring_timer
+        self._ring_timer = None
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        plan = self._ring_plan
+        self._ring_plan = None
+        if hasattr(self, "ring_action") and self.ring_action.isChecked():
+            self.ring_action.setChecked(False)
+        if not plan:
+            return
+        script = tablet.stop_ring_command(plan["component"], plan["restore"])
+
+        def job():
+            self._device_shell(plan["serial"], script)
+            self.logline(f"[Find] Stopped ringing {plan['serial']}")
+            self.ui(self.status_var.set, "Stopped ringing")
+
+        if wait:
+            job()
+        else:
+            self.worker(job)
+
+    def _set_find_message(self, enabled):
+        if not enabled:
+            self._clear_find_message()
+            return
+        serial = self.require_serial()
+        if not serial:
+            self.find_message_action.setChecked(False)
+            return
+        identity = self._identity_by_address.get(serial) or self._connected_identity
+        label = f"Serial {identity.serial}" if identity and identity.serial else ""
+        self._find_message_serial = serial
+
+        def job():
+            rc, out = self._device_shell(serial, tablet.find_message_command(label))
+            if rc != 0:
+                self.logline(f"[Find] Could not show the message: {out.strip()}")
+                self.ui(self.find_message_action.setChecked, False)
+                self._find_message_serial = None
+                return
+            self.logline(f"[Find] Showing the CDM message on {serial}")
+            self.ui(self.status_var.set,
+                    "Find-me message on screen · Device › Show find-me message to clear")
+
+        self.worker(job)
+
+    def _clear_find_message(self, wait=False):
+        serial = self._find_message_serial
+        self._find_message_serial = None
+        if hasattr(self, "find_message_action") and self.find_message_action.isChecked():
+            self.find_message_action.setChecked(False)
+        if not serial:
+            return
+
+        def job():
+            self._device_shell(serial, tablet.clear_message_command())
+            self.logline(f"[Find] Cleared the CDM message on {serial}")
+
+        if wait:
+            job()
+        else:
+            self.worker(job)
+
+    def _stop_find_device(self, wait=False):
+        self._stop_ringing(wait=wait)
+        self._clear_find_message(wait=wait)
+
     def disconnect_tunnel(self):
+        self._stop_find_device()
+        # A restart queued by the stream probe must not fire once the tunnel is
+        # gone; on the gateway route it would go to the local ADB server.
+        self._pending_restart = False
+        if self.scrcpy_proc and self.scrcpy_proc.poll() is None:
+            self._mirror_requested_stop = True
+            self._terminate_scrcpy()
         local_port = self.ssh_port
-        target = f"{legacy.DEFAULT_IP}:{local_port}" if local_port else None
+        gateway_proc = self._gateway_proc if self._gateway_target else None
+        if gateway_proc is not None:
+            target = self._gateway_target
+        else:
+            target = f"{legacy.DEFAULT_IP}:{local_port}" if local_port else None
         proc = self.ssh_proc
         self.ssh_proc = None
         self._connected_identity = None
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+        if gateway_proc is None:
+            self._terminate_quietly(proc)
 
         def job():
             if target:
+                # On the gateway route this has to run before the forward
+                # closes, or the shared server keeps a stale entry for the
+                # device.
                 result = legacy.adb_command("disconnect", target, timeout=20)
                 self.logline(f"[ADB] disconnect {target}: {result[1] or 'done'}")
+            if gateway_proc is not None:
+                self._leave_gateway_mode(gateway_proc)
             self.ui(self._set_tunnel_state, "Disconnected", "idle")
             self.ui(self._set_route_state, "Not connected", "idle")
             self.ui(self.status_var.set, "Disconnected")
             self.ui(self.device_pill.setText, "No device")
+            # Drop the device from the list now rather than at the next manual
+            # refresh, so nothing keeps acting on a transport that is gone.
+            self._refresh_devices_job()
 
         self.ssh_port = None
         self.ssh_remote_port = None
@@ -2306,6 +2771,8 @@ class CdcV2Window(v1.CdcMainWindow):
 
     def _device_changed(self, serial):
         serial = (serial or "").strip()
+        if hasattr(self, "tablet_card"):
+            self._sync_tablet_card(serial)
         identity = self._connected_identity
         if serial and identity:
             self._show_identity(identity)
@@ -2320,7 +2787,10 @@ class CdcV2Window(v1.CdcMainWindow):
         # serial carries the leased port itself.  Recognise either.
         if serial and self.tunnel_label.property("tone") != "online":
             leased = conn.parse_endpoint(self.port_edit.text())
-            if self.ssh_port and serial == f"{legacy.DEFAULT_IP}:{self.ssh_port}":
+            if self._gateway_target and serial == self._gateway_target:
+                self._set_tunnel_state(
+                    f"Live on {self.ssh_remote_port or leased}", "online")
+            elif self.ssh_port and serial == f"{legacy.DEFAULT_IP}:{self.ssh_port}":
                 self._set_tunnel_state(
                     f"Live on {self.ssh_remote_port or leased}", "online")
             elif leased is not None and serial == f"{legacy.DEFAULT_IP}:{leased}":
@@ -2365,6 +2835,14 @@ class CdcV2Window(v1.CdcMainWindow):
                 else "Connected · display protection off",
             )
             self._start_stream_capability_probe(serial)
+            if self._is_tablet(serial):
+                # Display protection switches off Rockchip picture processing
+                # on the media players.  A tablet has none of those properties,
+                # and writing them as root would only be noise.
+                self._guard_status_by_serial[serial] = "not_applicable"
+                self._set_ai_pq_status("Not used on tablets", "idle")
+                self._set_mirror_state("ready", "Connected · tablet")
+                return
             if not self._display_protection_enabled:
                 self._guard_status_by_serial[serial] = "disabled"
                 self._set_ai_pq_status(
@@ -2732,6 +3210,8 @@ class CdcV2Window(v1.CdcMainWindow):
         config = self._resolve_stream_config(serial)
         title = f"{legacy.APP_SHORT_NAME} Mirror {time.time_ns()}"
         command = self._build_scrcpy_command(serial, title, config)
+        if self._gateway_target and serial == self._gateway_target:
+            command.extend(conn.gateway_scrcpy_args(self._scrcpy_port))
         self._mirror_requested_stop = False
         self._pending_restart = False
         self._scrcpy_fps = None
@@ -3567,7 +4047,8 @@ class CdcV2Window(v1.CdcMainWindow):
         return sync_result.changed_keys
 
     def _ai_pq_watchdog(self):
-        if self._display_protection_enabled and self.active_serial():
+        serial = self.active_serial()
+        if self._display_protection_enabled and serial and not self._is_tablet(serial):
             self.enforce_ai_pq_off(silent=True)
 
     @staticmethod
@@ -3907,8 +4388,18 @@ class CdcV2Window(v1.CdcMainWindow):
     def closeEvent(self, event):
         self._save_layout()
         self._usage_timer.stop()
+        if not getattr(self, "capture_proc", None):
+            # The base class refuses to close only while a diagnostic capture
+            # runs.  Otherwise this is the last moment the tunnel is up: put
+            # the device's volume back and leave the shared gateway server
+            # tidy before the forward is torn down.  Best effort only.
+            self._stop_find_device(wait=True)
+            if self._gateway_target and self._gateway_proc is not None:
+                legacy.adb_command(
+                    "disconnect", self._gateway_target, timeout=5, telemetry=False)
         super().closeEvent(event)
         if event.isAccepted():
+            self._leave_gateway_mode()
             self._closing = True
             self._mirror_generation += 1
             app = QApplication.instance()
