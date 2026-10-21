@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 import cdc_connection as conn
+import cdc_icons
 import cdc_qt as v1
 import cdc_tablet as tablet
 import cdc_usage as usage
@@ -65,7 +66,7 @@ from cdc_ai_guard import (
 
 
 APP_NAME = legacy.APP_NAME
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 
 
 def _offscreen_origin():
@@ -158,6 +159,11 @@ APP_BAR_CONTROL_HEIGHT = 38
 # disclosures, plus the shell margins and the vertical scroll bar. The old 302px
 # floor clipped the right column of the three-wide grids; this one has room.
 SIDEBAR_MIN_WIDTH = 272
+SIDEBAR_DEFAULT_WIDTH = 340
+# The sidebar moved to the right in 2.8.  A 2.7 splitter state holds the sizes
+# in the old order and would open the mirror 272px wide, so the key is new.
+MAIN_SPLITTER_KEY = "ui/main_splitter_v28"
+VOLUME_ROCKER_WIDTH = 46
 
 AI_SETTINGS_PACKAGE = "com.android.tv.settings"
 AI_SETTINGS_COMPONENT = f"{AI_SETTINGS_PACKAGE}/.MainSettings"
@@ -186,7 +192,7 @@ QLabel#DevicePill {{
     color: {v1.MUTED}; background: {v1.SURFACE}; border: 1px solid {v1.BORDER};
     border-radius: 6px; padding: 7px 10px;
 }}
-QFrame#SidebarV2 {{ background: {v1.SIDEBAR}; border-right: 1px solid {v1.BORDER}; }}
+QFrame#SidebarV2 {{ background: {v1.SIDEBAR}; border-left: 1px solid {v1.BORDER}; }}
 QPushButton#ConnectionAction {{
     min-height: {PRIMARY_ACTION_HEIGHT - 2}px; max-height: {PRIMARY_ACTION_HEIGHT - 2}px;
     padding: 0 12px; font-size: 13px; font-weight: 800;
@@ -235,6 +241,18 @@ QLabel#ToggleName {{ font-size: 10px; font-weight: 600; color: {v1.MUTED}; }}
 QLabel#ToggleValue {{ font-size: 10px; font-weight: 800; color: {v1.SUBTLE}; }}
 QLabel#ToggleValue[tone="online"] {{ color: {v1.GREEN}; }}
 QLabel#ToggleValue[tone="error"] {{ color: {v1.RED}; }}
+QPushButton[remoteKey="true"] {{ padding: 0; }}
+QFrame#VolumeRocker {{
+    background: {v1.SURFACE_2}; border: 1px solid {v1.BORDER}; border-radius: 22px;
+}}
+QPushButton#VolumeUp, QPushButton#VolumeDown {{
+    background: transparent; border: 0; padding: 0; min-height: 40px;
+}}
+QPushButton#VolumeUp {{ border-top-left-radius: 21px; border-top-right-radius: 21px; }}
+QPushButton#VolumeDown {{ border-bottom-left-radius: 21px; border-bottom-right-radius: 21px; }}
+QPushButton#VolumeUp:hover, QPushButton#VolumeDown:hover {{ background: {v1.SURFACE_3}; }}
+QPushButton#VolumeUp:pressed, QPushButton#VolumeDown:pressed {{ background: {v1.BORDER}; }}
+QLabel#VolumeGlyph {{ background: transparent; padding: 2px 0; }}
 QPushButton#CompactIcon {{
     min-width: {APP_BAR_CONTROL_HEIGHT - 2}px; max-width: {APP_BAR_CONTROL_HEIGHT - 2}px;
     min-height: {APP_BAR_CONTROL_HEIGHT - 2}px;
@@ -682,11 +700,13 @@ class CdcV2Window(v1.CdcMainWindow):
         self.main_splitter.setChildrenCollapsible(False)
         self.main_splitter.setHandleWidth(6)
         self.sidebar = self._build_sidebar()
-        self.main_splitter.addWidget(self.sidebar)
+        # Controls on the right, like the remote in the operator's other hand:
+        # the mirror is what is read, the controls are what is reached for.
         self.main_splitter.addWidget(self._build_workspace())
-        self.main_splitter.setStretchFactor(0, 0)
-        self.main_splitter.setStretchFactor(1, 1)
-        self.main_splitter.setSizes([SIDEBAR_MIN_WIDTH, 1200])
+        self.main_splitter.addWidget(self.sidebar)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setSizes([1200, SIDEBAR_DEFAULT_WIDTH])
         outer.addWidget(self.main_splitter, 1)
 
         # Visible unless the operator hid it with Alt last session.
@@ -776,6 +796,9 @@ class CdcV2Window(v1.CdcMainWindow):
         self.find_message_action.setToolTip(
             "Open the notification panel on the device with a CDM message and "
             "its serial")
+        device_menu.addSeparator()
+        self.history_menu = device_menu.addMenu("Recent devices")
+        self.history_menu.aboutToShow.connect(self._populate_history_menu)
 
         help_menu = self._add_menu("&Help")
         self._menu_action(help_menu, "Keyboard shortcuts", self._show_shortcuts, "Ctrl+/")
@@ -984,30 +1007,14 @@ class CdcV2Window(v1.CdcMainWindow):
         content_layout.setSpacing(7)
         content_layout.addWidget(self._connection_card_v2())
 
-        category_nav = QFrame()
-        category_nav.setObjectName("CategoryNav")
-        nav_layout = QHBoxLayout(category_nav)
-        nav_layout.setContentsMargins(4, 4, 4, 4)
-        nav_layout.setSpacing(3)
+        # One page.  The Remote / Device tabs hid half the controls behind a
+        # click, and the device tools were the half people went looking for.
         self.category_buttons = []
-        self.category_group = QButtonGroup(self)
-        self.category_group.setExclusive(True)
-        for index, title in enumerate(("Remote", "Device")):
-            button = _role(QPushButton(title), "nav")
-            button.setCheckable(True)
-            button.setProperty("active", index == 0)
-            button.clicked.connect(lambda _checked=False, page=index: self._show_category(page))
-            self.category_group.addButton(button, index)
-            self.category_buttons.append(button)
-            nav_layout.addWidget(button, 1)
-        self.category_buttons[0].setChecked(True)
-        content_layout.addWidget(category_nav)
-
         self.category_stack = QStackedWidget()
+        self.tools_card = self._tools_card()
         self.category_stack.addWidget(self._category_page(
-            self._tablet_card(), self._remote_card(), self._recovery_card()))
-        self.category_stack.addWidget(self._category_page(
-            self._ai_pq_card_v2(), self._tools_card()))
+            self._tablet_card(), self._remote_card(), self._recovery_card(),
+            self.tools_card, self._ai_pq_card_v2()))
         content_layout.addWidget(self.category_stack)
         content_layout.addStretch(1)
         scroll.setWidget(content)
@@ -1017,7 +1024,7 @@ class CdcV2Window(v1.CdcMainWindow):
         # layout cell. The Connect/Mirror pair intentionally remains the larger
         # primary action size.
         for button in shell.findChildren(QPushButton):
-            if button.objectName() == "ConnectionAction":
+            if button.objectName() in ("ConnectionAction", "VolumeUp", "VolumeDown"):
                 continue
             button.setObjectName("StandardAction")
             button.setProperty("controlSize", "standard")
@@ -1035,6 +1042,20 @@ class CdcV2Window(v1.CdcMainWindow):
         self.usage_panel.metric_changed.connect(
             lambda key: self.settings.setValue("ui/usage_metric", key))
         content_layout.insertWidget(1, self.usage_panel)
+
+        # Fit the panel, never the longest string in it.  Each control asked
+        # for the width of its own text -- the stream preset alone wanted
+        # 600px for "Normal · 1280 × 720 · 30 FPS · 5 Mbps · H.264" -- and the
+        # widest one set the width of the whole scroll content, so every card
+        # ran off the right edge with its last column cut in half.
+        for combo in content.findChildren(QComboBox):
+            combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+        for widget in content.findChildren(QWidget):
+            if isinstance(widget, (QPushButton, QComboBox, QLabel, QLineEdit)):
+                if widget.minimumWidth() == 0:
+                    widget.setMinimumWidth(1)
 
         self.sidebar_scroll = scroll
         return shell
@@ -1227,13 +1248,6 @@ class CdcV2Window(v1.CdcMainWindow):
         layout.addWidget(button)
         return button
 
-    def _action_button(self, text, callback, role=None):
-        button = QPushButton(text)
-        if role:
-            _role(button, role)
-        button.clicked.connect(lambda _checked=False, slot=callback: slot())
-        return button
-
     def _tablet_card(self):
         """Controls that only make sense on a tablet.
 
@@ -1247,30 +1261,31 @@ class CdcV2Window(v1.CdcMainWindow):
         layout.addWidget(self.tablet_status_label)
 
         self.auto_rotate_button = self._action_button(
-            "⟳  Auto-rotate", lambda: self._set_auto_rotate(
-                self.auto_rotate_button.isChecked()))
+            "Auto-rotate", lambda: self._set_auto_rotate(
+                self.auto_rotate_button.isChecked()), icon="auto_rotate")
         self.auto_rotate_button.setCheckable(True)
         self.auto_rotate_button.setToolTip(
             "Let the tablet turn its screen with the device, or hold it still")
-        rotate = self._action_button("↻  Rotate", self._rotate_once)
+        rotate = self._action_button("Rotate", self._rotate_once, icon="rotate")
         rotate.setToolTip("Turn the screen a quarter turn and lock it there")
         layout.addWidget(self._grid_of([self.auto_rotate_button, rotate], columns=2))
 
         layout.addWidget(self._grid_of([
-            self._action_button("☀  Wake", lambda: self._tablet_shell(
-                tablet.WAKE_COMMAND, "Woke the screen", check_cover=True)),
-            self._action_button("☾  Lock", lambda: self._tablet_shell(
-                tablet.LOCK_COMMAND, "Locked the screen")),
-            self._action_button("▮  Battery", self.check_power_status),
+            self._action_button("Wake", lambda: self._tablet_shell(
+                tablet.WAKE_COMMAND, "Woke the screen", check_cover=True),
+                icon="wake"),
+            self._action_button("Lock", lambda: self._tablet_shell(
+                tablet.LOCK_COMMAND, "Locked the screen"), icon="lock"),
+            self._action_button("Battery", self.check_power_status, icon="battery"),
         ]))
 
         self.ring_button = self._action_button(
-            "♪  Ring", lambda: self.ring_action.trigger())
+            "Ring", lambda: self.ring_action.trigger(), icon="ring")
         self.ring_button.setCheckable(True)
         self.ring_button.setToolTip(self.ring_action.toolTip())
         self.ring_action.toggled.connect(self.ring_button.setChecked)
         self.find_button = self._action_button(
-            "⚑  Find-me", lambda: self.find_message_action.trigger())
+            "Find-me", lambda: self.find_message_action.trigger(), icon="find")
         self.find_button.setCheckable(True)
         self.find_button.setToolTip(self.find_message_action.toolTip())
         self.find_message_action.toggled.connect(self.find_button.setChecked)
@@ -1279,24 +1294,99 @@ class CdcV2Window(v1.CdcMainWindow):
         card.hide()
         return card
 
+    def _action_button(self, text, callback, role=None, icon=None, tip=None):
+        button = QPushButton(text)
+        if role:
+            _role(button, role)
+        if icon:
+            button.setIcon(cdc_icons.icon(icon))
+            button.setIconSize(cdc_icons.ICON_SIZE)
+        if tip:
+            button.setToolTip(tip)
+        button.clicked.connect(lambda _checked=False, slot=callback: slot())
+        return button
+
+    def _key_button(self, icon, tip, callback):
+        """A remote key: the picture only, like the key on a real remote."""
+        button = self._action_button("", callback, icon=icon, tip=tip)
+        button.setProperty("remoteKey", True)
+        button.setAccessibleName(tip)
+        return button
+
+    def _volume_rocker(self):
+        """Volume as one vertical pill, the rocker on a TV remote.
+
+        Two separate "Vol +" and "Vol −" buttons sat in the grid like any other
+        command; a rocker says what it is at a glance and is pressed without
+        reading.
+        """
+        key = self.send_keyevent
+        rocker = QFrame()
+        rocker.setObjectName("VolumeRocker")
+        rocker.setFixedWidth(VOLUME_ROCKER_WIDTH)
+        column = QVBoxLayout(rocker)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        up = QPushButton()
+        up.setObjectName("VolumeUp")
+        up.setIcon(cdc_icons.icon("plus"))
+        up.setIconSize(cdc_icons.ICON_SIZE)
+        up.setToolTip("Volume up")
+        up.setAccessibleName("Volume up")
+        up.clicked.connect(lambda _checked=False: key("24"))
+        label = QLabel()
+        label.setObjectName("VolumeGlyph")
+        label.setPixmap(cdc_icons.icon("speaker", "#7F93B2").pixmap(14, 14))
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        down = QPushButton()
+        down.setObjectName("VolumeDown")
+        down.setIcon(cdc_icons.icon("minus"))
+        down.setIconSize(cdc_icons.ICON_SIZE)
+        down.setToolTip("Volume down")
+        down.setAccessibleName("Volume down")
+        down.clicked.connect(lambda _checked=False: key("25"))
+        for widget in (up, down):
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        column.addWidget(up, 1)
+        column.addWidget(label)
+        column.addWidget(down, 1)
+        self.volume_up_button = up
+        self.volume_down_button = down
+        return rocker
+
     def _remote_card(self):
         card, layout = self._card("Remote control")
         key = self.send_keyevent
 
-        layout.addWidget(self._grid_of([
-            self._action_button("←  Back", lambda: key("4")),
-            self._action_button("⌂  Home", lambda: key("3")),
-            self._action_button("⏎  OK", lambda: key("66")),
-        ]))
-        # U+25C4/U+25BA rather than the U+23EE media glyphs: the media set has an
-        # emoji presentation by default, so it rendered in colour next to the
-        # monochrome symbols and looked like a mistake.
+        keys = QGridLayout()
+        keys.setContentsMargins(0, 0, 0, 0)
+        keys.setSpacing(4)
+        keys.addWidget(self._key_button("back", "Back", lambda: key("4")), 0, 0)
+        keys.addWidget(self._key_button("home", "Home", lambda: key("3")), 0, 1)
+        keys.addWidget(self._key_button(
+            "recents", "Recent apps", lambda: key("187")), 0, 2)
+        keys.addWidget(self._key_button("menu", "Menu", lambda: key("82")), 1, 0)
+        keys.addWidget(self._key_button("ok", "OK", lambda: key("66")), 1, 1)
+        keys.addWidget(self._key_button("power", "Power", lambda: key("26")), 1, 2)
+        keys.addWidget(self._key_button("mute", "Mute", lambda: key("164")), 2, 0)
+        keys.addWidget(self._key_button(
+            "screenshot", "Screenshot", self.screenshot), 2, 1)
+        keys.addWidget(self._key_button(
+            "settings", "Device settings", self.open_device_settings), 2, 2)
+
+        pad = QHBoxLayout()
+        pad.setContentsMargins(0, 0, 0, 0)
+        pad.setSpacing(6)
+        pad.addLayout(keys, 1)
+        pad.addWidget(self._volume_rocker())
+        layout.addLayout(pad)
+
         # Media keys drive the players' video app; a tablet has nothing they
         # control, so the row hides while one is connected.
         self.media_keys_row = self._grid_of([
-            self._action_button("◄◄", lambda: key("88")),
-            self._action_button("►  Play", lambda: key("85")),
-            self._action_button("►►", lambda: key("87")),
+            self._key_button("previous", "Previous", lambda: key("88")),
+            self._key_button("play", "Play / pause", lambda: key("85")),
+            self._key_button("next", "Next", lambda: key("87")),
         ])
         layout.addWidget(self.media_keys_row)
 
@@ -1305,16 +1395,9 @@ class CdcV2Window(v1.CdcMainWindow):
         more_layout.setContentsMargins(0, 4, 0, 0)
         more_layout.setSpacing(4)
         more_layout.addWidget(self._grid_of([
-            self._action_button("☰  Menu", lambda: key("82")),
-            self._action_button("⏻  Power", lambda: key("26")),
-            self._action_button("☀  Wake", lambda: key("224")),
-            self._action_button("☾  Sleep", lambda: key("223")),
-            self._action_button("Vol  −", lambda: key("25")),
-            self._action_button("⊘  Mute", lambda: key("164")),
-            self._action_button("Vol  +", lambda: key("24")),
-            self._action_button("⛶  Shot", self.screenshot),
-            self._action_button("⚙  Settings", self.open_device_settings),
-        ]))
+            self._action_button("Wake", lambda: key("224"), icon="wake"),
+            self._action_button("Sleep", lambda: key("223"), icon="sleep"),
+        ], columns=2))
         custom = QHBoxLayout()
         self.key_edit = QLineEdit()
         self.key_edit.setPlaceholderText("Key code")
@@ -1541,10 +1624,10 @@ class CdcV2Window(v1.CdcMainWindow):
         return str(value).strip().lower() in ("1", "true", "yes", "on")
 
     def _restore_layout(self):
-        main_state = self.settings.value("ui/main_splitter")
+        main_state = self.settings.value(MAIN_SPLITTER_KEY)
         workspace_state = self.settings.value("ui/workspace_splitter")
         if not main_state or not self.main_splitter.restoreState(main_state):
-            self.main_splitter.setSizes([SIDEBAR_MIN_WIDTH, 1200])
+            self.main_splitter.setSizes([1200, SIDEBAR_DEFAULT_WIDTH])
         else:
             self._last_main_splitter_state = main_state
         if not workspace_state or not self.workspace_splitter.restoreState(workspace_state):
@@ -1597,7 +1680,7 @@ class CdcV2Window(v1.CdcMainWindow):
             sidebar_visible = self.sidebar.isVisible()
             console_visible = not self._console_collapsed
         if main_state:
-            self.settings.setValue("ui/main_splitter", main_state)
+            self.settings.setValue(MAIN_SPLITTER_KEY, main_state)
         if workspace_state:
             self.settings.setValue("ui/workspace_splitter", workspace_state)
         self.settings.setValue("ui/sidebar_visible", sidebar_visible)
@@ -1654,11 +1737,16 @@ class CdcV2Window(v1.CdcMainWindow):
             return
         serial = self.active_serial()
         if serial != self._usage_serial:
-            # Another device, or none: its history would only mislead.
+            previous = self._usage_serial
             self._usage_serial = serial
             self._usage_sampler.reset()
             self._usage_failures = 0
-            self.usage_panel.clear()
+            if serial or not previous:
+                # Another device: its history would only mislead.
+                self.usage_panel.clear()
+            else:
+                # Disconnected: the readings fall to zero and stop there.
+                self.usage_panel.drop_to_zero("Device disconnected")
         if not serial:
             self.usage_panel.set_status("No device", "idle")
             return
@@ -1687,6 +1775,10 @@ class CdcV2Window(v1.CdcMainWindow):
             self._usage_failures += 1
             if self._usage_failures == 3:
                 self.logline(f"[Usage] {serial} is not answering: {exc}")
+            if self._usage_failures == 2:
+                # A lease that expired leaves the device listed but silent;
+                # holding the last readings made it look alive.
+                self.usage_panel.drop_to_zero("Device not answering")
             self.usage_panel.set_status(
                 "Not answering" if self._usage_failures >= 2 else "Retrying…",
                 "error" if self._usage_failures >= 2 else "pending")
@@ -1740,7 +1832,7 @@ class CdcV2Window(v1.CdcMainWindow):
             self.exit_focus_mode()
         self._set_sidebar_visible(True)
         self._set_console_visible(False)
-        self.main_splitter.setSizes([SIDEBAR_MIN_WIDTH, max(700, self.width() - SIDEBAR_MIN_WIDTH)])
+        self.main_splitter.setSizes([max(700, self.width() - SIDEBAR_DEFAULT_WIDTH), SIDEBAR_DEFAULT_WIDTH])
         self.workspace_splitter.setSizes([max(430, self.height() - 102), 22])
         self._last_main_splitter_state = self.main_splitter.saveState()
         self._last_workspace_splitter_state = self.workspace_splitter.saveState()
@@ -1797,6 +1889,12 @@ class CdcV2Window(v1.CdcMainWindow):
             "Ctrl+O\tAdd or change SSH key\n"
             "Ctrl+I\tInstall APK\n"
             "Ctrl+Shift+S\tSave command log")
+
+    def _show_category(self, index):
+        """There is one page now; "the Device page" means the tools on it."""
+        self.category_stack.setCurrentIndex(0)
+        if index == 1 and hasattr(self, "sidebar_scroll"):
+            self.sidebar_scroll.ensureWidgetVisible(self.tools_card, 0, 0)
 
     def _show_diagnostics(self):
         self._set_sidebar_visible(True)
@@ -2242,6 +2340,8 @@ class CdcV2Window(v1.CdcMainWindow):
                 "tunnel as up but unverified.")
         else:
             self._connected_identity = identity
+            self.ui(self._record_connection, identity, self.ssh_remote_port,
+                    "gateway" if self._gateway_target else "direct")
             self.logline(
                 f"[Device] {identity.label()}"
                 + (f" · {identity.model}" if identity.model else "")
@@ -2453,6 +2553,28 @@ class CdcV2Window(v1.CdcMainWindow):
         return (self._identity_by_address.get(serial)
                 or (self._connected_identity if serial else None))
 
+    def _keep_audio_on_device(self, serial, command):
+        """On a tablet, let the device keep playing while audio is mirrored.
+
+        scrcpy's default audio source takes over the device's whole output, so
+        Android goes silent on the device and everything plays on the PC --
+        including the Ring tone meant to be heard by someone on site.  Playback
+        capture with --audio-dup mirrors the sound and leaves the tablet's own
+        speaker on.  It needs Android 13; older tablets keep the default.
+        """
+        if not self._is_tablet(serial):
+            return
+        identity = self._identity_for(serial)
+        try:
+            android = int((identity.android or "0").split(".")[0])
+        except (AttributeError, ValueError):
+            android = 0
+        if android < 13 or "--audio-source" not in command:
+            return
+        index = command.index("--audio-source")
+        command[index + 1] = "playback"
+        command.append("--audio-dup")
+
     def _is_tablet(self, serial):
         identity = self._identity_for(serial)
         return bool(identity) and tablet.is_tablet(
@@ -2522,6 +2644,82 @@ class CdcV2Window(v1.CdcMainWindow):
         self._tablet_shell(
             tablet.rotate_command(self._tablet_rotation),
             "Rotated the screen")
+
+    # ---------- connection history ----------
+    _HISTORY_KEY = "history/devices"
+    _HISTORY_LIMIT = 20
+
+    def _device_history(self):
+        import json
+        raw = self.settings.value(self._HISTORY_KEY, "", str) or ""
+        try:
+            entries = json.loads(raw) if raw else []
+        except ValueError:
+            return []
+        return [e for e in entries if isinstance(e, dict) and e.get("serial")]
+
+    def _record_connection(self, identity, remote_port, route):
+        """Remember who answered and when.
+
+        The port is kept only as context.  It was a lease, so it is never
+        offered back as something to connect to.
+        """
+        import json
+        if not identity or not identity.serial:
+            return
+        entry = {
+            "serial": identity.serial,
+            "model": identity.model,
+            "kind": "Tablet" if tablet.is_tablet(
+                identity.characteristics, identity.model) else "Media player",
+            "port": remote_port,
+            "route": route,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+        entries = [entry] + self._device_history()
+        self.settings.setValue(
+            self._HISTORY_KEY, json.dumps(entries[:self._HISTORY_LIMIT]))
+
+    @staticmethod
+    def _history_label(entry):
+        try:
+            when = datetime.fromisoformat(entry["at"])
+            stamp = when.strftime("%d %b %Y, %I:%M %p").replace(" 0", " ")
+        except (KeyError, ValueError):
+            stamp = "time unknown"
+        parts = [entry.get("serial", "")]
+        if entry.get("model"):
+            parts.append(entry["model"])
+        parts.append(stamp)
+        if entry.get("port"):
+            parts.append(f"port {entry['port']}")
+        return "  ·  ".join(parts)
+
+    def _populate_history_menu(self):
+        menu = self.history_menu
+        menu.clear()
+        entries = self._device_history()
+        if not entries:
+            empty = menu.addAction("No devices connected yet")
+            empty.setEnabled(False)
+            return
+        for entry in entries:
+            action = menu.addAction(self._history_label(entry))
+            action.setToolTip(
+                f"{entry.get('kind', '')} · click to copy the serial")
+            action.triggered.connect(
+                lambda _checked=False, serial=entry["serial"]:
+                    self._copy_serial(serial))
+        menu.addSeparator()
+        menu.addAction("Clear history", self._clear_device_history)
+
+    def _copy_serial(self, serial):
+        QApplication.clipboard().setText(serial)
+        self.status_var.set(f"Copied {serial}")
+
+    def _clear_device_history(self):
+        self.settings.remove(self._HISTORY_KEY)
+        self.status_var.set("Device history cleared")
 
     def check_power_status(self):
         """Device › Battery and screen."""
@@ -3212,6 +3410,7 @@ class CdcV2Window(v1.CdcMainWindow):
         command = self._build_scrcpy_command(serial, title, config)
         if self._gateway_target and serial == self._gateway_target:
             command.extend(conn.gateway_scrcpy_args(self._scrcpy_port))
+        self._keep_audio_on_device(serial, command)
         self._mirror_requested_stop = False
         self._pending_restart = False
         self._scrcpy_fps = None

@@ -39,7 +39,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location -Path $PSScriptRoot
 
-$AppVersion  = '2.7.0'
+$AppVersion  = '2.8.0'
 $DistName    = 'ConvrseDeviceControl'
 $ExeName     = 'Convrse Device Control.exe'
 $DistDir     = Join-Path $PSScriptRoot "dist\$DistName"

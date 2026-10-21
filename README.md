@@ -13,8 +13,12 @@ protection, and production diagnostics.
   double-click enter focus mode, while Escape exits it.
 - Fixed, consistent control sizing: 40 px connection actions, 36 px sidebar
   actions, and 38 px app-bar controls.
-- Two compact sidebar categories: Remote and Device. A Tablet card joins
-  Remote when a tablet is connected (see Tablets).
+- One control panel on the right of the mirror: Device, Remote control, App
+  recovery, Tools and Display processing on a single scrolling page. A Tablet
+  card joins it when a tablet is connected (see Tablets).
+- The remote pad uses line icons rather than text symbols: Back, Home,
+  Recent apps, Menu, OK, Power, Mute, Screenshot and Settings, with volume as a
+  vertical rocker beside them and the media keys underneath.
 - The menu bar stays out of the workspace until Alt is pressed. The command log
   is a thin collapsed strip until Ctrl+J is pressed.
 - **View › Show usage** (Ctrl+U) adds a Usage card to the left pane: live CPU,
@@ -55,9 +59,16 @@ the Display processing card. Display protection is skipped on tablets.
   Samsung, which refuses a remote wake while its book cover is shut.
 - Auto-rotate on/off, Rotate (a quarter turn, then held), Wake, Lock.
 - **Ring** plays a ringtone at full volume until stopped, then restores the
-  volume. **Find-me** opens the notification panel with a CDM message and the
+  volume. While mirroring a tablet on Android 13+, audio is captured with
+  `--audio-source playback --audio-dup`, so the tablet's own speaker keeps
+  playing and the ring is heard on site, not only on the PC. **Find-me** opens the notification panel with a CDM message and the
   serial. Both are also under **Device** in the menu bar (Ctrl+R, Ctrl+M), with
   **Battery and screen** (Ctrl+P).
+- **Device › Recent devices** lists the last 20 connections with serial, model,
+  date, time and the port that was leased then. Clicking one copies its serial;
+  the port is shown for context only, because it was a lease.
+- The Usage card falls to zero and holds when the device disconnects or stops
+  answering, instead of freezing on its last readings.
 
 ## Production features
 
@@ -174,7 +185,7 @@ Build it once on an M-series Mac by double-clicking
 bash build-macos-arm64.sh
 ```
 
-The resulting installer is written to `versions/macos/v2.7.0`. The control app and
+The resulting installer is written to `versions/macos/v2.8.0`. The control app and
 scrcpy mirror use separate native Mac windows because the Windows HWND
 embedding mechanism has no safe Cocoa equivalent. See
 `docs/MACOS-APPLE-SILICON.md` for signing, notarization, and distribution details.

@@ -556,10 +556,49 @@ class UsagePanel(QFrame):
         for history in self._history.values():
             history.clear()
         self._latest = None
+        self._dropped = False
         self._message = message
         self._render()
 
+    def drop_to_zero(self, message="Device disconnected"):
+        """The device went away: every live reading falls to zero, then holds.
+
+        Clearing instead made the panel look frozen on its last values until
+        the next device arrived, which read as the device still being busy.
+        Capacities that do not stop existing -- installed memory, disk size --
+        keep their totals so the rows still say what was measured.
+        """
+        last = self._latest
+        if last is None or getattr(self, "_dropped", False):
+            self._message = message
+            self._render()
+            return
+        zero = usage.UsageSample(
+            serial=last.serial,
+            cpu_percent=0.0,
+            core_percents=[0.0] * len(last.core_percents),
+            cpu_cores=last.cpu_cores,
+            gpu_percent=0.0 if last.gpu_percent is not None else None,
+            mem_total=last.mem_total,
+            mem_used=0 if last.mem_total else None,
+            mem_available=last.mem_total,
+            storage_total=last.storage_total,
+            storage_used=last.storage_used,
+            storage_free=last.storage_free,
+            storage_mount=last.storage_mount,
+            disk_active_percent=0.0,
+            disk_read_bps=0.0,
+            disk_write_bps=0.0,
+            net_rx_bps=0.0,
+            net_tx_bps=0.0,
+            net_interface=last.net_interface,
+        )
+        self.add_sample(zero)
+        self._dropped = True
+        self._message = message
+
     def add_sample(self, sample):
+        self._dropped = False
         self._latest = sample
         self._message = ""
         history = self._history

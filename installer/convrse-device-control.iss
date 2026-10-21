@@ -10,7 +10,7 @@
 ; ISCC comes from Inno Setup 6 (https://jrsoftware.org/isdl.php).
 
 #define AppName        "Convrse Device Control"
-#define AppVersion     "2.7.0"
+#define AppVersion     "2.8.0"
 #define AppPublisher   "Convrse Media Private Limited"
 #define AppExeName     "Convrse Device Control.exe"
 ; Overridable so the build can stage somewhere else when the usual output

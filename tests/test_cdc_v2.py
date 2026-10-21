@@ -194,15 +194,13 @@ class CdcV2Tests(unittest.TestCase):
 
         self.assertEqual(cdc_v2.DEFAULT_PRESET, "Balanced")
 
-    def test_minimal_header_and_two_category_navigation(self):
+    def test_minimal_header_and_single_control_page(self):
         window = self._window()
 
         self.assertEqual(window.windowTitle(), cdc_v2.APP_NAME)
-        self.assertEqual(
-            [button.text() for button in window.category_buttons],
-            ["Remote", "Device"],
-        )
-        self.assertEqual(window.category_stack.count(), 2)
+        # Remote and Device were merged into one page in 2.8.
+        self.assertEqual(window.category_buttons, [])
+        self.assertEqual(window.category_stack.count(), 1)
         self.assertFalse(hasattr(window, "stage_toolbar"))
         remote_page_text = " ".join(
             label.text()
@@ -526,6 +524,9 @@ class CdcV2Tests(unittest.TestCase):
         )
 
         for button in window.sidebar.findChildren(QPushButton):
+            if button.objectName() in ("VolumeUp", "VolumeDown"):
+                # The rocker is one tall pill by design, not two sidebar rows.
+                continue
             expected_height = (
                 cdc_v2.PRIMARY_ACTION_HEIGHT
                 if button.objectName() == "ConnectionAction"
@@ -888,7 +889,7 @@ class CdcV2Tests(unittest.TestCase):
 
         device_page_text = " ".join(
             button.text()
-            for button in window.category_stack.widget(1).findChildren(QPushButton)
+            for button in window.category_stack.widget(0).findChildren(QPushButton)
         )
         self.assertNotIn("Open display", device_page_text)
         self.assertNotIn("Enforce", device_page_text)
@@ -1843,7 +1844,8 @@ class GatewayRouteWindowTests(DeviceListNamingTests):
         window = self._window()
         texts = [a.text() for a in window._menus["&Device"].actions() if a.text()]
         self.assertEqual(
-            texts, ["Battery and screen", "Ring device", "Show find-me message"])
+            texts, ["Battery and screen", "Ring device", "Show find-me message",
+                    "Recent devices"])
 
     def test_tablet_card_shows_only_for_tablets(self):
         import cdc_connection as conn
@@ -1875,3 +1877,83 @@ class GatewayRouteWindowTests(DeviceListNamingTests):
         self.assertIn("cover is closed", window.tablet_status_label.text())
         self.assertTrue(window.auto_rotate_button.isChecked())
         self.assertEqual(window._tablet_rotation, 0)
+
+    def test_controls_sit_on_the_right_of_the_mirror(self):
+        window = self._window()
+        self.assertIs(window.main_splitter.widget(1), window.sidebar)
+
+    def test_remote_has_recents_and_a_volume_rocker(self):
+        window = self._window()
+        tips = {b.toolTip() for b in window.sidebar.findChildren(QPushButton)}
+        self.assertIn("Recent apps", tips)
+        window.worker = lambda job: job()
+        with mock.patch.object(window, "require_serial", return_value="fake:17000"), \
+                mock.patch.object(
+                    cdc_v2.legacy, "adb_command",
+                    return_value=(0, "", 0.1)) as adb, \
+                mock.patch.object(window, "_report_power_status"):
+            window.volume_up_button.click()
+            window.volume_down_button.click()
+        codes = [c.args[-1] for c in adb.call_args_list
+                 if c.args[:3] == ("shell", "input", "keyevent")]
+        self.assertEqual(codes, ["24", "25"])
+        self.assertEqual(window.volume_up_button.objectName(), "VolumeUp")
+        self.assertFalse(window.volume_up_button.icon().isNull())
+
+    def test_remote_keys_carry_pictures_not_text_symbols(self):
+        window = self._window()
+        for button in window.sidebar.findChildren(QPushButton):
+            if button.property("remoteKey"):
+                with self.subTest(tip=button.toolTip()):
+                    self.assertEqual(button.text(), "")
+                    self.assertFalse(button.icon().isNull())
+
+    def test_history_records_and_labels_connections(self):
+        import cdc_connection as conn
+        window = self._window()
+        window._clear_device_history()
+        identity = conn.DeviceIdentity(
+            serial="R9ZY70QLQ7N", model="SM-X216B", characteristics="tablet")
+        window._record_connection(identity, 17000, "gateway")
+        entries = window._device_history()
+        self.assertEqual(entries[0]["serial"], "R9ZY70QLQ7N")
+        self.assertEqual(entries[0]["kind"], "Tablet")
+        label = window._history_label(entries[0])
+        self.assertIn("R9ZY70QLQ7N", label)
+        self.assertIn("port 17000", label)
+        window._populate_history_menu()
+        texts = [a.text() for a in window.history_menu.actions() if a.text()]
+        self.assertEqual(texts[-1], "Clear history")
+
+    def test_tablet_mirror_keeps_sound_on_the_device(self):
+        import cdc_connection as conn
+        window = self._window()
+        window._identity_by_address["127.0.0.1:17000"] = conn.DeviceIdentity(
+            serial="R9ZY70QLQ7N", model="SM-X216B", android="16",
+            characteristics="tablet")
+        command = ["scrcpy", "--audio-source", "output"]
+        window._keep_audio_on_device("127.0.0.1:17000", command)
+        self.assertEqual(command, ["scrcpy", "--audio-source", "playback", "--audio-dup"])
+        player = ["scrcpy", "--audio-source", "output"]
+        window._keep_audio_on_device("127.0.0.1:49215", player)
+        self.assertEqual(player, ["scrcpy", "--audio-source", "output"])
+
+    def test_usage_falls_to_zero_when_the_device_goes_away(self):
+        import cdc_usage
+        window = self._window()
+        panel = window.usage_panel
+        panel.add_sample(cdc_usage.UsageSample(
+            serial="R9ZY70QLQ7N", cpu_percent=63.0, gpu_percent=40.0,
+            mem_total=4 << 30, mem_used=3 << 30, net_rx_bps=8e6, net_tx_bps=1e6,
+            disk_active_percent=12.0))
+        panel.drop_to_zero("Device disconnected")
+        latest = panel._latest
+        self.assertEqual(latest.cpu_percent, 0.0)
+        self.assertEqual(latest.gpu_percent, 0.0)
+        self.assertEqual(latest.mem_used, 0)
+        self.assertEqual(latest.net_rx_bps, 0.0)
+        self.assertEqual(latest.mem_total, 4 << 30)
+        # A second drop does not keep appending zeros.
+        before = len(panel._history["cpu"])
+        panel.drop_to_zero("Device disconnected")
+        self.assertEqual(len(panel._history["cpu"]), before)
